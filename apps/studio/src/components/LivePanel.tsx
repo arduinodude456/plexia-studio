@@ -24,7 +24,9 @@ import {
   hasSupabaseConfig,
   listSessionResponses,
   requestAiEvaluation,
+  savePresentation,
   subscribeToSession,
+  supabase,
   updateClassSession,
   updateTeacherReview,
   type ClassSession,
@@ -51,11 +53,23 @@ interface HandwritingReading {
   confidence?: number;
 }
 
+interface PrivateQuizKey { slideId: string; correctIndex: number; explanation: string }
+interface LiveParticipant { userId: string; nickname: string; joinedAt: string }
+interface SharedSlideResult { slideId: string; title: string; responseCount: number; options?: Array<{ label: string; count: number }> }
+
 const MAX_VISIBLE_RESPONSES = 80;
 const publicConnectUrl = (import.meta as ImportMeta & { env: Record<string, string | undefined> }).env.VITE_CONNECT_URL;
 
 function safeText(value: unknown, maxLength = 4000): string {
   return typeof value === "string" ? value.slice(0, maxLength) : "";
+}
+
+function stripPrivateAnswerFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripPrivateAnswerFields);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => !["correctIndex", "correct_index", "answerKey", "answer_key", "explanation"].includes(key))
+    .map(([key, child]) => [key, stripPrivateAnswerFields(child)]));
 }
 
 function safeTextList(value: unknown, maxItems = 30): string[] {
@@ -73,6 +87,41 @@ function responseText(response: StudentResponse): string {
   } catch {
     return "Antwort übermittelt";
   }
+}
+
+function choicesFor(response: StudentResponse): string[] {
+  const choices = response.answerJson?.choices;
+  if (Array.isArray(choices)) return choices.filter((value): value is string => typeof value === "string");
+  return response.answerText.split(",").map((value) => value.trim()).filter(Boolean);
+}
+
+function ideasFor(response: StudentResponse): string[] {
+  const ideas = response.answerJson?.ideas;
+  const source = Array.isArray(ideas) ? ideas : response.answerText.split(/[\n,]+/);
+  return source.filter((value): value is string => typeof value === "string").map((value) => value.trim().slice(0, 180)).filter(Boolean);
+}
+
+function wordFrequencies(responses: StudentResponse[]): Array<{ word: string; count: number }> {
+  const stop = new Set("aber alle als also am an andere auch auf aus bei beim bin bis bist da dadurch daher damit dann das dass dein deine dem den der des die dies doch dort du durch ein eine einem einen einer eines er es etwas für gegen gewesen hat hatte haben hier hinter ich im in ist ja jede jeder jedes kann kein keine mit nach nicht noch nun oder sein seine sich sie sind so über um und uns unter vom von vor war waren was weg weil weiter welche wenn werde werden wie wieder wir wo zu zum zur".split(" "));
+  const counts = new Map<string, number>();
+  for (const response of responses) for (const idea of ideasFor(response)) {
+    for (const word of idea.toLocaleLowerCase("de").normalize("NFKC").match(/[\p{L}\p{N}-]{3,}/gu) ?? []) {
+      if (!stop.has(word)) counts.set(word, (counts.get(word) ?? 0) + 1);
+    }
+  }
+  return [...counts].map(([word, count]) => ({ word, count })).sort((a, b) => b.count - a.count || a.word.localeCompare(b.word, "de")).slice(0, 40);
+}
+
+function stableHash(value: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) hash = Math.imul(hash ^ value.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+function buildGroupAssignment(sessionId: string, slideId: string, participants: LiveParticipant[], groupSize: number): Record<string, number> {
+  const numberOfGroups = Math.max(1, Math.ceil(participants.length / groupSize));
+  const shuffled = [...participants].sort((a, b) => stableHash(`${sessionId}:${slideId}:${a.userId}`) - stableHash(`${sessionId}:${slideId}:${b.userId}`));
+  return Object.fromEntries(shuffled.map((participant, index) => [participant.userId, (index % numberOfGroups) + 1]));
 }
 
 export function LivePanel({ presentation, onClose }: Props) {
@@ -105,6 +154,14 @@ export function LivePanel({ presentation, onClose }: Props) {
   const [readingHandwriting, setReadingHandwriting] = useState("");
   const [handwritingError, setHandwritingError] = useState("");
   const [handwriting, setHandwriting] = useState<{ responseId: string; result: HandwritingReading } | null>(null);
+  const [privateQuizKeys, setPrivateQuizKeys] = useState<PrivateQuizKey[]>([]);
+  const [quizKeyNotice, setQuizKeyNotice] = useState("");
+  const [participants, setParticipants] = useState<LiveParticipant[]>([]);
+  const [groupSize, setGroupSize] = useState(4);
+  const [groupAssignments, setGroupAssignments] = useState<Record<string, Record<string, number>>>({});
+  const [groupsForSlide, setGroupsForSlide] = useState("");
+  const [sharingResults, setSharingResults] = useState(false);
+  const [shareNotice, setShareNotice] = useState("");
 
   const update = (response: StudentResponse) =>
     setResponses((prev) => (prev.some((item) => item.id === response.id)
@@ -114,6 +171,15 @@ export function LivePanel({ presentation, onClose }: Props) {
   useEffect(() => {
     if (!session || !hasSupabaseConfig) return;
     let active = true;
+    const refreshParticipants = async () => {
+      if (!supabase) return;
+      const { data, error: participantError } = await supabase.from("session_participants")
+        .select("user_id,nickname,joined_at").eq("session_id", session.id).order("joined_at", { ascending: true });
+      if (participantError) throw participantError;
+      if (active) setParticipants((data ?? []).map((row) => ({
+        userId: String(row.user_id), nickname: String(row.nickname || "Teilnehmer"), joinedAt: String(row.joined_at || ""),
+      })));
+    };
     void listSessionResponses(session.id)
       .then((items) => {
         if (active) setResponses(items);
@@ -121,13 +187,34 @@ export function LivePanel({ presentation, onClose }: Props) {
       .catch((e: unknown) => {
         if (active) setError(e instanceof Error ? e.message : "Antworten konnten nicht geladen werden.");
       });
+    void refreshParticipants().catch((e: unknown) => {
+      if (active) setError(e instanceof Error ? e.message : "Teilnehmende konnten nicht geladen werden.");
+    });
+    if (supabase) {
+      void supabase.from("teacher_quiz_keys").select("slide_id,correct_index,explanation")
+        .eq("presentation_id", session.presentationId)
+        .then(({ data, error: keyError }) => {
+          if (!active) return;
+          if (keyError) {
+            setQuizKeyNotice("Private Quiz-Schlüssel nicht verfügbar. Wende die neue Lehrer-Schlüssel-Migration an und prüfe die Lehrkraft-RLS.");
+            return;
+          }
+          setPrivateQuizKeys((data ?? []).map((row) => ({
+            slideId: String(row.slide_id), correctIndex: Number(row.correct_index), explanation: String(row.explanation ?? ""),
+          })).filter((row) => Number.isInteger(row.correctIndex) && row.correctIndex >= 0));
+          setQuizKeyNotice("");
+        });
+    }
     const channel = subscribeToSession(
       session.id,
       (next) => {
         if (active) setSession(next);
       },
       (response) => {
-        if (active) update(response);
+        if (active) {
+          update(response);
+          void refreshParticipants().catch(() => undefined);
+        }
       },
     );
     return () => {
@@ -140,7 +227,8 @@ export function LivePanel({ presentation, onClose }: Props) {
     setBusy(true);
     setError("");
     try {
-      const created = await createClassSession(presentation);
+      const studentSafePresentation = stripPrivateAnswerFields(presentation) as Presentation;
+      const created = await createClassSession(studentSafePresentation);
       setSession(created);
       setNotice("Sitzung gestartet. Teile den Code mit deiner Klasse.");
     } catch (e) {
@@ -206,8 +294,76 @@ export function LivePanel({ presentation, onClose }: Props) {
     }
   }
 
+  const currentIndex = session?.currentSlideIndex ?? 0;
+  const current = presentation.slides[currentIndex];
   const visibleResponses = responses.slice(-MAX_VISIBLE_RESPONSES);
   const currentSelectedResponse = responses.find((item) => item.id === selected);
+  const currentSlideResponses = current ? responses.filter((response) => response.slideId === current.id) : [];
+  const currentQuizKey = current ? privateQuizKeys.find((item) => item.slideId === current.id) : undefined;
+  const currentOptions = Array.isArray(current?.content.options) ? current.content.options.filter((item): item is string => typeof item === "string") : [];
+  const optionCounts = currentOptions.map((label, index) => ({
+    label,
+    count: currentSlideResponses.filter((response) => choicesFor(response).includes(label)).length,
+    correct: currentQuizKey?.correctIndex === index,
+  }));
+  const ideasByResponse = currentSlideResponses.flatMap((response) => ideasFor(response).map((idea) => ({ idea, nickname: safeText(response.nickname, 24).trim() || "Teilnehmer" })));
+  const frequencyWords = wordFrequencies(currentSlideResponses);
+  const assignment = current ? groupAssignments[current.id] : undefined;
+  const assignedGroups = assignment ? [...new Set(Object.values(assignment))].sort((a, b) => a - b) : [];
+
+  async function assignGroups() {
+    if (!session || !current || !supabase) return;
+    const size = Math.max(2, Math.min(12, Math.trunc(groupSize) || 4));
+    setGroupSize(size);
+    const { data, error: rosterError } = await supabase.from("session_participants")
+      .select("user_id,nickname,joined_at").eq("session_id", session.id).order("joined_at", { ascending: true });
+    if (rosterError) {
+      setError(rosterError.message || "Die Teilnehmerliste konnte nicht aktualisiert werden.");
+      return;
+    }
+    const roster = (data ?? []).map((row) => ({ userId: String(row.user_id), nickname: String(row.nickname || "Teilnehmer"), joinedAt: String(row.joined_at || "") }));
+    setParticipants(roster);
+    setGroupAssignments((previous) => ({
+      ...previous,
+      [current.id]: buildGroupAssignment(session.id, current.id, roster, size),
+    }));
+    setGroupsForSlide(current.id);
+  }
+
+  async function shareAggregatedResults() {
+    const resultsSlide = current?.type === "results" ? current : presentation.slides.find((slide) => slide.type === "results");
+    if (!resultsSlide) {
+      setShareNotice("Füge der Präsentation zuerst eine Ergebnisse-Folie hinzu.");
+      return;
+    }
+    setSharingResults(true);
+    setShareNotice("");
+    try {
+      const safeResults: SharedSlideResult[] = presentation.slides
+        .filter((slide) => ["multiple_choice", "poll", "mindmap", "brainstorm", "wordcloud", "group_work", "free_text", "worksheet", "photo_task"].includes(slide.type))
+        .map((slide) => {
+          const slideResponses = responses.filter((response) => response.slideId === slide.id);
+          if (slide.type === "multiple_choice" || slide.type === "poll") {
+            const options = Array.isArray(slide.content.options) ? slide.content.options.filter((option): option is string => typeof option === "string") : [];
+            return { slideId: slide.id, title: safeText(slide.title, 160), responseCount: slideResponses.length, options: options.map((label) => ({ label: safeText(label, 200), count: slideResponses.filter((response) => choicesFor(response).includes(label)).length })) };
+          }
+          return { slideId: slide.id, title: safeText(slide.title, 160), responseCount: slideResponses.length };
+        });
+      const safePresentation = stripPrivateAnswerFields({
+        ...presentation,
+        slides: presentation.slides.map((slide) => slide.id === resultsSlide.id
+          ? { ...slide, content: { ...slide.content, sharedResults: safeResults } }
+          : slide),
+        updatedAt: new Date().toISOString(),
+      }) as Presentation;
+      await savePresentation(safePresentation);
+      setShareNotice("Aggregierte, lösungsschlüsselfreie Resultate wurden in der Ergebnisse-Folie gespeichert und mit verbundenen Connect-Geräten synchronisiert.");
+    } catch (e) {
+      setShareNotice(e instanceof Error ? e.message : "Die aggregierten Resultate konnten nicht geteilt werden.");
+    } finally {
+      setSharingResults(false);
+    }
+  }
 
   async function summarizeResponses() {
     if (visibleResponses.length === 0) return;
@@ -281,8 +437,6 @@ export function LivePanel({ presentation, onClose }: Props) {
     }
   }
 
-  const currentIndex = session?.currentSlideIndex ?? 0;
-  const current = presentation.slides[currentIndex];
   const joinUrl = (() => {
     try {
       const url = new URL(connectBase, location.origin);
@@ -365,6 +519,53 @@ export function LivePanel({ presentation, onClose }: Props) {
                 <div><h3>Antworten</h3><small>{responses.length} {responses.length === 1 ? "Beitrag" : "Beiträge"}{responses.length > MAX_VISIBLE_RESPONSES ? ` · letzte ${MAX_VISIBLE_RESPONSES} angezeigt` : ""}</small></div>
                 <span className="response-count"><Users size={15} />{responses.length}</span>
               </div>
+
+              {current && (current.type === "multiple_choice" || current.type === "poll") && <section className="live-ai-panel" aria-live="polite">
+                <div className="live-ai-title"><Activity size={15} /><strong>{current.type === "multiple_choice" ? "Live-Quiz-Auswertung" : "Live-Umfrage"}</strong></div>
+                <p>{currentSlideResponses.length} Antworten zu „{current.title}“. Nur für die Lehrkraft sichtbar.</p>
+                {optionCounts.length ? optionCounts.map((option) => <div key={option.label} style={{ margin: "9px 0" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12 }}>
+                    <strong>{option.label}{option.correct ? " · richtig (Lehrkraft)" : ""}</strong><span>{option.count} · {currentSlideResponses.length ? Math.round(option.count / currentSlideResponses.length * 100) : 0}%</span>
+                  </div>
+                  <div style={{ height: 8, borderRadius: 8, background: "var(--line)", overflow: "hidden", marginTop: 4 }}>
+                    <div style={{ height: "100%", width: `${currentSlideResponses.length ? option.count / currentSlideResponses.length * 100 : 0}%`, background: option.correct ? "#37ad8a" : "#7d6de2", transition: "width .25s ease" }} />
+                  </div>
+                </div>) : <p>Für diese Folie sind keine Auswahloptionen hinterlegt.</p>}
+                {current.type === "multiple_choice" && currentQuizKey
+                  ? <p><strong>Auswertung:</strong> {currentSlideResponses.filter((response) => choicesFor(response).includes(currentOptions[currentQuizKey.correctIndex] ?? "")).length} von {currentSlideResponses.length} richtig.{currentQuizKey.explanation && <> <strong>Erklärung:</strong> {currentQuizKey.explanation}</>}</p>
+                  : current.type === "multiple_choice" && <p className="live-ai-empty">Kein privater Lösungsschlüssel verfügbar; die Verteilung wird ohne Richtig/Falsch-Auswertung angezeigt.{quizKeyNotice && <> {quizKeyNotice}</>}</p>}
+              </section>}
+
+              {current && ["mindmap", "brainstorm", "wordcloud"].includes(current.type) && <section className="live-ai-panel" aria-live="polite">
+                <div className="live-ai-title"><Sparkles size={15} /><strong>{current.type === "mindmap" ? "Gemeinsame Mindmap" : current.type === "wordcloud" ? "Live-Wortwolke" : "Ideen aus der Klasse"}</strong></div>
+                <p>{currentSlideResponses.length} Teilnehmende · {ideasByResponse.length} Ideen — aktualisiert sich mit Antworten.</p>
+                {current.type === "wordcloud"
+                  ? frequencyWords.length ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 9, minHeight: 115, padding: 12, borderRadius: 10, background: "var(--surface)" }}>{frequencyWords.map(({ word, count }) => <span key={word} title={`${count}× genannt`} style={{ color: count > 1 ? "#6655c8" : "var(--ink)", fontWeight: 700, fontSize: `${Math.min(28, 12 + count * 4)}px`, padding: "3px 7px" }}>{word}<small style={{ fontSize: 10, marginLeft: 3 }}>×{count}</small></span>)}</div> : <p className="live-ai-empty">Noch keine verwertbaren Wörter.</p>
+                  : current.type === "mindmap" ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 8, minHeight: 110, padding: 12, borderRadius: 10, background: "var(--surface)" }}><strong style={{ borderRadius: 24, padding: "10px 14px", background: "#ece9ff", color: "#4c3eb0" }}>{safeText(current.content.prompt || current.title, 150)}</strong>{ideasByResponse.map(({ idea, nickname }, index) => <span key={`${index}-${idea}`} title={nickname} style={{ borderRadius: 20, padding: "7px 11px", background: index % 2 ? "#e3f7f2" : "#e7f4fb", color: "#30445f", fontSize: 12 }}>{idea}</span>)}</div>
+                  : ideasByResponse.length ? <ol style={{ paddingLeft: 24 }}>{ideasByResponse.map(({ idea, nickname }, index) => <li key={`${index}-${idea}`} style={{ margin: "7px 0", overflowWrap: "anywhere" }}><span>{idea}</span><small style={{ display: "block", color: "var(--muted)" }}>{nickname}</small></li>)}</ol> : <p className="live-ai-empty">Noch keine Ideen eingegangen.</p>}
+              </section>}
+
+              {current?.type === "group_work" && <section className="live-ai-panel">
+                <div className="live-ai-title"><Users size={15} /><strong>Gruppen zuteilen</strong></div>
+                <p>{participants.length} pseudonyme Teilnehmende in dieser Sitzung. Zuteilung ist ausgewogen und bleibt fest, bis du sie erneut ausführst.</p>
+                <label className="review-field">Zielgröße je Gruppe <select value={groupSize} onChange={(event) => setGroupSize(Number(event.target.value))} style={{ display: "block", width: "100%", padding: 8, borderRadius: 7, border: "1px solid var(--line)", background: "var(--surface)", color: "var(--ink)" }}>{Array.from({ length: 11 }, (_, index) => index + 2).map((size) => <option key={size} value={size}>{size}</option>)}</select></label>
+                <button className="button secondary live-action-button" onClick={assignGroups} disabled={participants.length === 0}><Users size={15} />{groupsForSlide === current.id ? "Gruppen neu zuteilen" : "Teilnehmende zufällig zuteilen"}</button>
+                {participants.length === 0 && <p className="live-ai-empty">Noch keine angemeldeten Teilnehmenden gefunden.</p>}
+                {assignment && groupsForSlide === current.id && assignedGroups.map((group) => <div key={group} style={{ marginTop: 10, padding: 10, borderRadius: 8, background: "var(--surface)" }}><strong>Gruppe {group}</strong><ul style={{ marginBottom: 0 }}>{participants.filter((participant) => assignment[participant.userId] === group).map((participant, index) => <li key={participant.userId}>{safeText(participant.nickname, 24) || `Teilnehmer ${index + 1}`}</li>)}</ul></div>)}
+              </section>}
+
+              {current?.type === "results" && <section className="live-ai-panel" aria-live="polite">
+                <div className="live-ai-title"><Activity size={15} /><strong>Resultate dieser Stunde</strong></div>
+                <p>Live-Zusammenfassung eingegangener Antworten aus der gesamten Präsentation. Lösungsschlüssel bleiben privat.</p>
+                {presentation.slides.filter((slide) => ["multiple_choice", "poll", "mindmap", "brainstorm", "wordcloud", "group_work", "free_text", "worksheet", "photo_task"].includes(slide.type)).map((slide) => {
+                  const slideResponses = responses.filter((response) => response.slideId === slide.id);
+                  const options = Array.isArray(slide.content.options) ? slide.content.options.filter((value): value is string => typeof value === "string") : [];
+                  return <div key={slide.id} style={{ margin: "10px 0", padding: 10, borderRadius: 8, background: "var(--surface)" }}><strong>{safeText(slide.title, 160)}</strong><div>{slideResponses.length} Antworten</div>{options.length > 0 && <ul>{options.map((option) => <li key={option}>{option}: {slideResponses.filter((response) => choicesFor(response).includes(option)).length}</li>)}</ul>}</div>;
+                })}
+                {shareNotice && <p role="status">{shareNotice}</p>}
+                <button className="button primary live-action-button" onClick={() => void shareAggregatedResults()} disabled={sharingResults || responses.length === 0}>{sharingResults ? <LoaderCircle className="spin" size={15} /> : <ExternalLink size={15} />}{sharingResults ? "Aggregat wird geteilt…" : "Aggregierte Resultate explizit teilen"}</button>
+                <small>Geteilt werden ausschließlich schlüsselfreie Aggregate. Connect zeigt nur freigegebene Zahlen, keine Namen oder individuellen Antworten.</small>
+              </section>}
 
               <div className="live-ai-panel">
                 <div className="live-ai-title"><Sparkles size={15} /><strong>Klassenüberblick</strong></div>

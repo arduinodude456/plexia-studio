@@ -124,6 +124,76 @@ export async function createSignedPresentationUrl(path: string, expiresIn = 3600
   return data.signedUrl;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+type PrivateMediaBucket = "presentation-media" | "student-uploads";
+
+async function listPrivateStorageFiles(bucket: PrivateMediaBucket, prefix: string): Promise<string[]> {
+  const client = requireSupabase();
+  const files: string[] = [];
+  const pageSize = 100;
+  async function walk(path: string, depth: number): Promise<void> {
+    if (depth > 3) throw new Error("Der private Medienordner hat eine unerwartet tiefe Struktur.");
+    for (let offset = 0; ; offset += pageSize) {
+      if (offset >= 10_000 * pageSize) throw new Error("Der private Medienordner enthält zu viele Dateien für eine sichere Bereinigung.");
+      const { data, error } = await client.storage.from(bucket).list(path, {
+        limit: pageSize, offset, sortBy: { column: "name", order: "asc" },
+      });
+      if (error) throw new Error(`Private Medien in ${bucket} konnten nicht sicher aufgelistet werden: ${error.message}`);
+      const entries = data ?? [];
+      for (const entry of entries) {
+        if (!entry.name || entry.name === "." || entry.name === ".." || entry.name.includes("/") || entry.name.includes("\\")) {
+          throw new Error("Der private Medienordner enthält einen ungültigen Dateinamen.");
+        }
+        const objectPath = `${path}/${entry.name}`;
+        if (entry.id) {
+          files.push(objectPath);
+          if (files.length > 20_000) throw new Error("Die Präsentation enthält zu viele private Dateien für eine sichere Bereinigung.");
+        } else {
+          await walk(objectPath, depth + 1);
+        }
+      }
+      if (entries.length < pageSize) break;
+    }
+  }
+  await walk(prefix, 0);
+  return files;
+}
+
+export async function deletePresentationStorage(presentationId: string): Promise<void> {
+  const client = requireSupabase();
+  if (!UUID_RE.test(presentationId)) throw new Error("Die Präsentations-ID ist ungültig; private Dateien wurden nicht gelöscht.");
+  const { data: userData, error: userError } = await client.auth.getUser();
+  if (userError) throw userError;
+  if (!userData.user) throw new Error("Bitte melde dich als Lehrkraft an, um private Präsentationsdateien zu löschen.");
+
+  const sessionIds: string[] = [];
+  for (let from = 0; ; from += 500) {
+    if (from >= 10_000) throw new Error("Zu viele Sitzungen hängen an dieser Präsentation; die sichere Löschung wurde abgebrochen.");
+    const { data, error } = await client.from("class_sessions").select("id")
+      .eq("presentation_id", presentationId).range(from, from + 499);
+    if (error) throw new Error(`Die Klassensitzungen konnten vor der Medienbereinigung nicht geladen werden: ${error.message}`);
+    for (const session of data ?? []) {
+      if (!UUID_RE.test(String(session.id))) throw new Error("Eine Sitzungs-ID ist ungültig; private Dateien wurden nicht gelöscht.");
+      sessionIds.push(String(session.id));
+    }
+    if (!data || data.length < 500) break;
+  }
+
+  const teacherFiles = await listPrivateStorageFiles("presentation-media", `${userData.user.id}/${presentationId}`);
+  const studentFiles: string[] = [];
+  for (const sessionId of sessionIds) {
+    studentFiles.push(...await listPrivateStorageFiles("student-uploads", sessionId));
+    if (teacherFiles.length + studentFiles.length > 20_000) throw new Error("Zu viele private Dateien hängen an dieser Präsentation; die sichere Löschung wurde abgebrochen.");
+  }
+
+  for (const [bucket, paths] of [["presentation-media", teacherFiles], ["student-uploads", studentFiles]] as const) {
+    for (let index = 0; index < paths.length; index += 100) {
+      const { error } = await client.storage.from(bucket).remove(paths.slice(index, index + 100));
+      if (error) throw new Error(`Private Dateien in ${bucket} konnten nicht vollständig über Supabase Storage gelöscht werden: ${error.message}`);
+    }
+  }
+}
+
 export async function createClassSession(presentation: Presentation): Promise<ClassSession> {
   const client = requireSupabase();
   await savePresentation(presentation);
@@ -174,6 +244,7 @@ export async function joinClassSession(joinCode: string, nickname: string): Prom
     p_nickname: nickname.trim().slice(0, 24),
   });
   if (error) throw error;
+  if (data && typeof data === "object" && "error" in data && typeof data.error === "string") throw new Error(data.error);
   const bundle = data as { session_id?: string; session?: Record<string, unknown>; presentation?: Presentation };
   if (bundle?.session && bundle.presentation) {
     return { session: mapSession(bundle.session), presentation: bundle.presentation };
@@ -194,22 +265,62 @@ export async function submitResponse(input: {
   const { data: userResult, error: userError } = await client.auth.getUser();
   if (userError) throw userError;
   if (!userResult.user?.is_anonymous) throw new Error("Schülerantworten müssen aus einer anonymen Teilnahmesitzung gesendet werden.");
+  const editable = {
+    answer_text: input.answerText ?? "",
+    answer_json: input.answerJson ?? {},
+    ...(input.mediaPath ? { media_path: input.mediaPath } : {}),
+  };
+  const existing = await client.from("student_responses").select("id")
+    .eq("session_id", input.sessionId).eq("slide_id", input.slideId)
+    .eq("participant_id", userResult.user.id).maybeSingle();
+  if (existing.error) throw existing.error;
+  if (existing.data) {
+    const { data, error } = await client.from("student_responses").update(editable)
+      .eq("id", existing.data.id).eq("participant_id", userResult.user.id)
+      .select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed").single();
+    if (error) throw error;
+    return mapResponse(data as Record<string, unknown>);
+  }
   const { data, error } = await client.from("student_responses").insert({
     session_id: input.sessionId,
     slide_id: input.slideId,
     participant_id: userResult.user.id,
     nickname: input.nickname.trim().slice(0, 24),
-    answer_text: input.answerText ?? "",
-    answer_json: input.answerJson ?? {},
-    media_path: input.mediaPath ?? null,
+    ...editable,
   }).select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed").single();
+  if (error?.code === "23505") {
+    const raced = await client.from("student_responses").select("id")
+      .eq("session_id", input.sessionId).eq("slide_id", input.slideId)
+      .eq("participant_id", userResult.user.id).maybeSingle();
+    if (raced.error) throw raced.error;
+    if (raced.data) {
+      const corrected = await client.from("student_responses").update(editable)
+        .eq("id", raced.data.id).eq("participant_id", userResult.user.id)
+        .select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed").single();
+      if (corrected.error) throw corrected.error;
+      return mapResponse(corrected.data as Record<string, unknown>);
+    }
+  }
   if (error) throw error;
   return mapResponse(data as Record<string, unknown>);
 }
 
+export async function getStudentResponse(sessionId: string, slideId: string): Promise<StudentResponse | null> {
+  const client = requireSupabase();
+  const { data: userResult, error: userError } = await client.auth.getUser();
+  if (userError) throw userError;
+  if (!userResult.user?.is_anonymous) return null;
+  const { data, error } = await client.from("student_responses")
+    .select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed")
+    .eq("session_id", sessionId).eq("slide_id", slideId)
+    .eq("participant_id", userResult.user.id).maybeSingle();
+  if (error) throw error;
+  return data ? mapResponse(data as Record<string, unknown>) : null;
+}
+
 export async function uploadStudentPhoto(sessionId: string, file: File): Promise<string> {
   const client = requireSupabase();
-  if (!file.type.startsWith("image/")) throw new Error("Bitte wähle eine Bilddatei aus.");
+  if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) throw new Error("Dieses Bildformat wird nicht unterstützt. Bitte wähle PNG, JPEG oder WebP; HEIC kann hier nicht hochgeladen werden.");
   if (file.size > 12 * 1024 * 1024) throw new Error("Das Foto darf höchstens 12 MB groß sein.");
   const { data: userResult, error: userError } = await client.auth.getUser();
   if (userError) throw userError;
@@ -242,11 +353,26 @@ export function subscribeToSession(
   onResponse: (response: StudentResponse) => void,
 ): RealtimeChannel {
   const client = requireSupabase();
+  const responseHandler = (payload: { new: Record<string, unknown> }) => {
+    if (payload.new?.id) onResponse(mapResponse(payload.new));
+  };
   return client.channel(`plexia-session-${sessionId}`)
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "class_sessions", filter: `id=eq.${sessionId}` },
       (payload: { new: Record<string, unknown> }) => onSession(mapSession(payload.new)))
     .on("postgres_changes", { event: "INSERT", schema: "public", table: "student_responses", filter: `session_id=eq.${sessionId}` },
-      (payload: { new: Record<string, unknown> }) => onResponse(mapResponse(payload.new)))
+      responseHandler)
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "student_responses", filter: `session_id=eq.${sessionId}` },
+      responseHandler)
+    .subscribe();
+}
+
+export function subscribeToPresentation(presentationId: string, onPresentation: (presentation: Presentation) => void): RealtimeChannel {
+  const client = requireSupabase();
+  return client.channel(`plexia-presentation-${presentationId}`)
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "presentations", filter: `id=eq.${presentationId}` },
+      (payload: { new: Record<string, unknown> }) => {
+        if (payload.new?.data && typeof payload.new.data === "object") onPresentation(payload.new.data as Presentation);
+      })
     .subscribe();
 }
 

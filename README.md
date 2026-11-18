@@ -15,7 +15,9 @@ Für Supabase lokal apps/studio/.env.local erstellen (Vorlage: .env.example) und
 
 ## GitHub Pages
 
-Der Workflow in .github/workflows/pages.yml baut diese App zusammen mit einer Workspace-Kopie von packages/shared und veröffentlicht apps/studio/dist. In GitHub unter Settings → Pages die Bereitstellung über GitHub Actions aktivieren. Repository-Variablen VITE_SUPABASE_URL und VITE_SUPABASE_ANON_KEY setzen. Ohne Werte startet die Site ausdrücklich im lokalen Demomodus.
+Dieses Repository ist auf ausdrücklichen Wunsch öffentlich; auch der vollständige Quellcode ist einsehbar. Committe keine echten Schülerdaten, Groq-Keys oder Service-Role-Credentials.
+
+Der Workflow in .github/workflows/pages.yml baut diese App zusammen mit einer Workspace-Kopie von packages/shared und veröffentlicht apps/studio/dist. In GitHub unter Settings → Pages die Bereitstellung über GitHub Actions aktivieren. Repository-Variablen VITE_SUPABASE_URL und VITE_SUPABASE_ANON_KEY setzen. Solange sie fehlen, überspringt der Pages-Workflow den Deploy; lokal ohne apps/studio/.env.local läuft die klar gekennzeichnete Demo.
 
 ## Supabase und Datenschutz
 

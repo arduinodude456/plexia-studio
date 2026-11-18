@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { AlertCircle, CheckCircle2, Download, LoaderCircle, Sparkles } from "lucide-react";
-import { createId, createSlide, groqProxy, hasSupabaseConfig, type Presentation } from "@plexia/shared";
+import { createId, createSlide, groqProxy, hasSupabaseConfig, savePresentation, supabase, type Presentation } from "@plexia/shared";
 import { exportPresentation } from "../lib/presentations";
 import "./QuizGenerator.css";
 
@@ -36,6 +36,7 @@ export function QuizGenerator({ keyConfigured, keyStatusLoading }: QuizGenerator
   const [questions, setQuestions] = useState<QuizQuestion[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [saveNotice, setSaveNotice] = useState("");
 
   async function generate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -58,8 +59,9 @@ export function QuizGenerator({ keyConfigured, keyStatusLoading }: QuizGenerator
     }
   }
 
-  function downloadPresentation() {
+  async function downloadPresentation() {
     if (!questions?.length) return;
+    setSaveNotice("");
     const safeSlides = questions.map((item, index) => {
       const slide = createSlide("multiple_choice", `Frage ${index + 1}`);
       slide.title = item.question.trim();
@@ -80,7 +82,34 @@ export function QuizGenerator({ keyConfigured, keyStatusLoading }: QuizGenerator
       version: 1,
       updatedAt: new Date().toISOString(),
     };
+    let privateKeySaved = false;
+    let saveMessage = "";
+    if (hasSupabaseConfig && supabase) {
+      try {
+        // Save the key-free presentation first; the private table is RLS restricted
+        // to its teacher owner and is never included in the presentation payload.
+        await savePresentation(presentation);
+        const { error: keyError } = await supabase.from("teacher_quiz_keys").upsert(
+          questions.map((item, index) => ({
+            presentation_id: presentation.id,
+            slide_id: safeSlides[index].id,
+            correct_index: item.correctIndex,
+            explanation: item.explanation.trim().slice(0, 2000),
+          })),
+          { onConflict: "presentation_id,slide_id" },
+        );
+        if (keyError) throw keyError;
+        privateKeySaved = true;
+      } catch (caught) {
+        saveMessage = caught instanceof Error ? caught.message : "Der private Lösungsschlüssel konnte nicht gespeichert werden.";
+      }
+    }
     exportPresentation(presentation);
+    setSaveNotice(privateKeySaved
+      ? "Präsentation und Lösungsschlüssel getrennt gespeichert. Der Export enthält keine Lösungen."
+      : hasSupabaseConfig
+        ? `Sichere Präsentation wurde exportiert; privater Lösungsschlüssel konnte nicht gespeichert werden: ${saveMessage} Speichere sie bei bestehender Lehrkraft-Anmeldung erneut.`
+        : "Sichere Präsentation wurde exportiert. Ohne Backend wird kein Lösungsschlüssel gespeichert.");
   }
 
   return (
@@ -146,10 +175,11 @@ export function QuizGenerator({ keyConfigured, keyStatusLoading }: QuizGenerator
         <section className="quiz-results" aria-live="polite">
           <div className="quiz-results-heading">
             <div><h3>Erzeugte Fragen</h3><span>{questions.length} {questions.length === 1 ? "Frage" : "Fragen"} · Lösungen nur für dich sichtbar</span></div>
-            <button className="button secondary quiz-download-button" type="button" onClick={downloadPresentation}>
+            <button className="button secondary quiz-download-button" type="button" onClick={() => void downloadPresentation()}>
               <Download size={16} /> Präsentation herunterladen
             </button>
           </div>
+          {saveNotice && <p className="quiz-generator-hint" role="status">{saveNotice}</p>}
           {questions.map((item, questionIndex) => (
             <article className="quiz-question-card" key={`${questionIndex}-${item.question}`}>
               <h4><span>{questionIndex + 1}</span>{item.question}</h4>
