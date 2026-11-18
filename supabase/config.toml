@@ -1,0 +1,4 @@
+project_id = "plexia-server"
+
+[functions.groq-proxy]
+verify_jwt = true

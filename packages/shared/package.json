@@ -1,0 +1,21 @@
+{
+  "name": "@plexia/shared",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.57.4",
+    "zod": "4.1.8"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
