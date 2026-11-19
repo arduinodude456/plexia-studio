@@ -96,6 +96,14 @@ export interface ClassSession {
   createdAt: string;
 }
 
+export interface SessionGroupAssignment {
+  sessionId: string;
+  slideId: string;
+  userId: string;
+  groupNumber: number;
+  assignedAt: string;
+}
+
 export interface SessionBundle {
   session: ClassSession;
   presentation: Presentation;

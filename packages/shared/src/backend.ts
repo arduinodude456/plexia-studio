@@ -1,5 +1,5 @@
 import { createClient, type RealtimeChannel, type SupabaseClient } from "@supabase/supabase-js";
-import type { ClassSession, Presentation, SessionBundle, StudentResponse } from "./model";
+import type { ClassSession, Presentation, SessionBundle, SessionGroupAssignment, StudentResponse } from "./model";
 
 const env = import.meta.env;
 const supabaseUrl = env.VITE_SUPABASE_URL as string | undefined;
@@ -44,6 +44,16 @@ function mapResponse(row: Record<string, unknown>): StudentResponse {
     score: row.score == null ? null : Number(row.score),
     feedback: row.feedback == null ? null : String(row.feedback),
     reviewed: Boolean(row.reviewed),
+  };
+}
+
+function mapGroupAssignment(row: Record<string, unknown>): SessionGroupAssignment {
+  return {
+    sessionId: String(row.session_id),
+    slideId: String(row.slide_id),
+    userId: String(row.user_id),
+    groupNumber: Number(row.group_number),
+    assignedAt: String(row.assigned_at ?? new Date().toISOString()),
   };
 }
 
@@ -345,6 +355,48 @@ export async function listSessionResponses(sessionId: string): Promise<StudentRe
     .eq("session_id", sessionId).order("created_at", { ascending: true });
   if (error) throw error;
   return (data ?? []).map((row: Record<string, unknown>) => mapResponse(row));
+}
+
+export async function listGroupAssignments(sessionId: string, slideId?: string): Promise<SessionGroupAssignment[]> {
+  const client = requireSupabase();
+  let query = client.from("session_group_assignments")
+    .select("session_id,slide_id,user_id,group_number,assigned_at")
+    .eq("session_id", sessionId)
+    .order("group_number", { ascending: true })
+    .order("assigned_at", { ascending: true });
+  if (slideId) query = query.eq("slide_id", slideId);
+  const { data, error } = await query;
+  if (error) throw error;
+  return (data ?? []).map((row) => mapGroupAssignment(row as Record<string, unknown>));
+}
+
+export async function saveGroupAssignments(sessionId: string, slideId: string, assignments: Record<string, number>): Promise<void> {
+  const client = requireSupabase();
+  const rows = Object.entries(assignments).map(([userId, groupNumber]) => ({
+    session_id: sessionId,
+    slide_id: slideId,
+    user_id: userId,
+    group_number: Math.max(1, Math.trunc(groupNumber)),
+  }));
+  const { error: deleteError } = await client.from("session_group_assignments")
+    .delete().eq("session_id", sessionId).eq("slide_id", slideId);
+  if (deleteError) throw deleteError;
+  if (!rows.length) return;
+  const { error } = await client.from("session_group_assignments").insert(rows);
+  if (error) throw error;
+}
+
+export async function getMyGroupAssignment(sessionId: string, slideId: string): Promise<SessionGroupAssignment | null> {
+  const client = requireSupabase();
+  const { data: userData, error: userError } = await client.auth.getUser();
+  if (userError) throw userError;
+  if (!userData.user) return null;
+  const { data, error } = await client.from("session_group_assignments")
+    .select("session_id,slide_id,user_id,group_number,assigned_at")
+    .eq("session_id", sessionId).eq("slide_id", slideId).eq("user_id", userData.user.id)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? mapGroupAssignment(data as Record<string, unknown>) : null;
 }
 
 export function subscribeToSession(

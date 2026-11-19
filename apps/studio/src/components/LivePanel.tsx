@@ -22,9 +22,11 @@ import {
   createSignedStudentPhotoUrl,
   groqProxy,
   hasSupabaseConfig,
+  listGroupAssignments,
   listSessionResponses,
   requestAiEvaluation,
   savePresentation,
+  saveGroupAssignments,
   subscribeToSession,
   supabase,
   updateClassSession,
@@ -190,6 +192,14 @@ export function LivePanel({ presentation, onClose }: Props) {
     void refreshParticipants().catch((e: unknown) => {
       if (active) setError(e instanceof Error ? e.message : "Teilnehmende konnten nicht geladen werden.");
     });
+    void listGroupAssignments(session.id).then((items) => {
+      if (!active) return;
+      const next: Record<string, Record<string, number>> = {};
+      for (const item of items) (next[item.slideId] ??= {})[item.userId] = item.groupNumber;
+      setGroupAssignments(next);
+    }).catch((e: unknown) => {
+      if (active) setError(e instanceof Error ? e.message : "Gruppenzuteilungen konnten nicht geladen werden.");
+    });
     if (supabase) {
       void supabase.from("teacher_quiz_keys").select("slide_id,correct_index,explanation")
         .eq("presentation_id", session.presentationId)
@@ -323,10 +333,14 @@ export function LivePanel({ presentation, onClose }: Props) {
     }
     const roster = (data ?? []).map((row) => ({ userId: String(row.user_id), nickname: String(row.nickname || "Teilnehmer"), joinedAt: String(row.joined_at || "") }));
     setParticipants(roster);
-    setGroupAssignments((previous) => ({
-      ...previous,
-      [current.id]: buildGroupAssignment(session.id, current.id, roster, size),
-    }));
+    const nextAssignment = buildGroupAssignment(session.id, current.id, roster, size);
+    try {
+      await saveGroupAssignments(session.id, current.id, nextAssignment);
+      setGroupAssignments((previous) => ({ ...previous, [current.id]: nextAssignment }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Die Gruppenzuteilung konnte nicht gespeichert werden.");
+      return;
+    }
     setGroupsForSlide(current.id);
   }
 
