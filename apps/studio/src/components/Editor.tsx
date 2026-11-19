@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, type DragEvent, type PointerEvent } from "react";
-import { AlignCenter, AlignLeft, AlignRight, ArrowDown, ArrowLeft, ArrowUp, BarChart3, Bold, Circle, Copy, Eye, Image, Italic, Layers, LineChart, MonitorPlay, MousePointer2, Plus, Redo2, Settings2, Shapes, Table2, Trash2, Type, Undo2, Upload, Video, X } from "lucide-react";
-import { createId, createSlide, hasSupabaseConfig, slideTypeLabels, uploadPresentationMedia, type Presentation, type PlexiaSlide, type SlideElement, type SlideType } from "@plexia/shared";
+import { useEffect, useRef, useState, type DragEvent, type FormEvent, type PointerEvent } from "react";
+import { AlignCenter, AlignLeft, AlignRight, ArrowDown, ArrowLeft, ArrowUp, BarChart3, Bold, Circle, Copy, Eye, Image, Italic, Layers, LineChart, LoaderCircle, MessageCircle, MonitorPlay, MousePointer2, Plus, Redo2, Send, Settings2, Shapes, Sparkles, Table2, Trash2, Type, Undo2, Upload, Video, X } from "lucide-react";
+import { createId, createSlide, groqProxy, hasSupabaseConfig, slideTypeLabels, uploadPresentationMedia, type Presentation, type PlexiaSlide, type SlideElement, type SlideType } from "@plexia/shared";
 import { SlideStage } from "./SlideStage";
 import { exportPresentation } from "../lib/presentations";
 import "./Editor.css";
@@ -71,6 +71,13 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
   const [preview,setPreview]=useState(false);
   const [chooser,setChooser]=useState(false);
   const [inspectorOpen,setInspectorOpen]=useState(false);
+  const [aiOpen,setAiOpen]=useState(false);
+  const [aiInput,setAiInput]=useState("");
+  const [aiBusy,setAiBusy]=useState(false);
+  const [aiError,setAiError]=useState("");
+  const [aiModel,setAiModel]=useState("llama-3.3-70b-versatile");
+  const [aiModels,setAiModels]=useState<Array<{id:string;contextWindow?:number}>>([]);
+  const [aiMessages,setAiMessages]=useState<Array<{role:"user"|"assistant";text:string}>>([]);
   const [notice,setNotice]=useState("");
   const [uploadingMedia,setUploadingMedia]=useState(false);
   const [dragSlideId,setDragSlideId]=useState("");
@@ -156,6 +163,28 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
     patchSlide({elements:slide.elements.map(element=>({...element,zIndex:order.get(element.id)??element.zIndex}))});
   }
   function navigate(delta: number) { const next=doc.slides[slideIndex+delta]; if(next)chooseSlide(next.id); }
+  async function openAi() {
+    setAiOpen(true); setAiError("");
+    if (!hasSupabaseConfig || aiModels.length > 0) return;
+    try {
+      const result = await groqProxy<{models?: Array<{id?: unknown;contextWindow?: unknown}>}>("list_models", {});
+      const models=(result.models??[]).filter((model): model is {id:string;contextWindow?:number} => typeof model.id === "string");
+      setAiModels(models); if (models.length && !models.some(model=>model.id===aiModel)) setAiModel(models[0].id);
+    } catch (error) { setAiError(error instanceof Error ? error.message : "Modelle konnten nicht geladen werden."); }
+  }
+  async function askAi(event?: FormEvent) {
+    event?.preventDefault(); const instruction=aiInput.trim();
+    if (!instruction || aiBusy) return;
+    setAiInput(""); setAiError(""); setAiMessages(messages=>[...messages,{role:"user",text:instruction}]); setAiBusy(true);
+    try {
+      const result=await groqProxy<{presentation?:Presentation;summary?:string}>("edit_presentation",{instruction,presentation:doc,model:aiModel});
+      if (!result.presentation?.slides?.length) throw new Error("Die KI hat keine gültige Präsentation zurückgegeben.");
+      const next={...result.presentation,id:doc.id,ownerId:doc.ownerId,version:1 as const,updatedAt:new Date().toISOString()};
+      commit(next); setAiMessages(messages=>[...messages,{role:"assistant",text:result.summary||"Die Präsentation wurde aktualisiert. Bitte prüfe die Änderungen auf der Arbeitsfläche."}]);
+      setSelectedId(""); setSlideId(next.slides[Math.min(slideIndex,next.slides.length-1)]?.id||next.slides[0].id);
+    } catch (error) { const message=error instanceof Error?error.message:"Die KI-Anfrage ist fehlgeschlagen."; setAiError(message); setAiMessages(messages=>[...messages,{role:"assistant",text:`Fehler: ${message}`}]); }
+    finally { setAiBusy(false); }
+  }
   useEffect(()=>{
     function handleKey(e: KeyboardEvent) {
       const target=e.target as HTMLElement | null;
@@ -214,9 +243,9 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
     <header className="editor-topbar">
       <button className="back-button" onClick={onBack}><ArrowLeft size={18}/><span>Alle Präsentationen</span></button>
       <div className="editor-doc"><input className="doc-title-input" value={doc.title} maxLength={160} onChange={e=>commit({...doc,title:e.target.value})} aria-label="Präsentationstitel"/><span className={`save-indicator ${saveError?"is-error":saving?"is-saving":"is-saved"}`}><i/> {saveError?"Nicht gespeichert":saving?"Wird gespeichert…":isCloud?"Cloud synchronisiert":"Lokal gespeichert"}</span></div>
-      <div className="editor-top-actions"><button className="icon-button" title="Rückgängig (Strg+Z)" aria-label="Rückgängig" disabled={!canUndo} onClick={()=>restore(historyIndex-1)}><Undo2 size={17}/></button><button className="icon-button" title="Wiederholen (Strg+Y)" aria-label="Wiederholen" disabled={!canRedo} onClick={()=>restore(historyIndex+1)}><Redo2 size={17}/></button><button className="button secondary hide-small" onClick={()=>exportPresentation(doc)}>Exportieren</button><button className="button secondary" onClick={()=>setPreview(true)}><Eye size={16}/><span className="hide-small">Vorschau</span></button><button className="button primary" onClick={onLive}><MonitorPlay size={17}/><span className="hide-small">Live starten</span></button></div>
+      <div className="editor-top-actions"><button className={`button ai-toggle ${aiOpen?"is-active":""}`} onClick={()=>aiOpen?setAiOpen(false):void openAi()}><Sparkles size={16}/><span className="hide-small">KI-Assistent</span></button><button className="icon-button" title="Rückgängig (Strg+Z)" aria-label="Rückgängig" disabled={!canUndo} onClick={()=>restore(historyIndex-1)}><Undo2 size={17}/></button><button className="icon-button" title="Wiederholen (Strg+Y)" aria-label="Wiederholen" disabled={!canRedo} onClick={()=>restore(historyIndex+1)}><Redo2 size={17}/></button><button className="button secondary hide-small" onClick={()=>exportPresentation(doc)}>Exportieren</button><button className="button secondary" onClick={()=>setPreview(true)}><Eye size={16}/><span className="hide-small">Vorschau</span></button><button className="button primary" onClick={onLive}><MonitorPlay size={17}/><span className="hide-small">Live starten</span></button></div>
     </header>
-    <div className="editor-body">
+    <div className={`editor-body ${aiOpen?"has-ai":""}`}>
       <aside className="slide-rail"><div className="rail-head"><div><strong>Deine Folien</strong><span>{doc.slides.length} {doc.slides.length===1?"Folie":"Folien"}</span></div><button className="icon-button mini-icon" onClick={()=>setChooser(true)} aria-label="Folie hinzufügen"><Plus size={18}/></button></div>
         <div className="slide-list">{doc.slides.map((s,i)=><button key={s.id} draggable className={`slide-thumb ${s.id===slide?.id?"active":""} ${s.id===dragSlideId?"is-dragging":""}`} onClick={()=>chooseSlide(s.id)} onDragStart={e=>{setDragSlideId(s.id);e.dataTransfer.setData("text/plain",s.id);e.dataTransfer.effectAllowed="move";}} onDragEnd={()=>setDragSlideId("")} onDragOver={e=>e.preventDefault()} onDrop={e=>dropSlide(e,s.id)} aria-current={s.id===slide?.id?"true":undefined} title="Zum Sortieren ziehen"><div className="thumb-canvas" style={{background:s.background}}><span className="thumb-title">{s.title||"Unbenannt"}</span><span className="thumb-sub">{String(s.content.question||s.content.prompt||s.content.body||s.content.instructions||slideTypeLabels[s.type])}</span><i className="thumb-accent"/></div><span className="thumb-name"><b>{String(i+1).padStart(2,"0")}</b> {s.title||"Unbenannt"}</span><span className="thumb-type">{slideTypeLabels[s.type]}</span></button>)}</div>
         <button className="add-slide-rail" onClick={()=>setChooser(true)}><Plus size={16}/> Neue Folie</button>
@@ -227,6 +256,7 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
         <div className="stage-caption"><span><MousePointer2 size={14}/> Elemente ziehen · mit Pfeiltasten verschieben</span><span>{String(slideIndex+1).padStart(2,"0")} / {String(doc.slides.length).padStart(2,"0")}</span></div>
         <div className="element-dock"><span>HINZUFÜGEN</span><button onClick={()=>add("text")} title="Text hinzufügen"><Type size={17}/> <span>Text</span></button><button onClick={()=>add("image")} title="Bild hinzufügen"><Image size={17}/> <span>Bild</span></button><button onClick={()=>add("video")} title="Video hinzufügen"><Video size={17}/> <span>Video</span></button><button onClick={()=>add("shape")} title="Form hinzufügen"><Shapes size={17}/> <span>Form</span></button><button onClick={()=>add("table")} title="Tabelle hinzufügen"><Table2 size={17}/> <span>Tabelle</span></button><button onClick={()=>add("chart")} title="Diagramm hinzufügen"><BarChart3 size={17}/> <span>Diagramm</span></button></div>
       </main>
+      {aiOpen&&<aside className="ai-sidebar" aria-label="KI-Assistent"><div className="ai-sidebar-head"><div><span className="ai-eyebrow"><Sparkles size={12}/> PLEXIA AI</span><strong>Folien gemeinsam bauen</strong></div><button className="icon-button mini-icon" aria-label="KI-Assistent schließen" onClick={()=>setAiOpen(false)}><X size={16}/></button></div><div className="ai-sidebar-model"><label>Groq-Modell<select value={aiModel} onChange={event=>setAiModel(event.target.value)} disabled={aiBusy}>{(aiModels.length?aiModels:[{id:"llama-3.3-70b-versatile"},{id:"llama-3.1-8b-instant"},{id:"openai/gpt-oss-20b"}]).map(model=><option key={model.id} value={model.id}>{model.id}</option>)}</select></label><small>Das Modell wird nur für diese Anfrage verwendet.</small></div><div className="ai-chat" aria-live="polite">{aiMessages.length===0?<div className="ai-empty"><MessageCircle size={22}/><strong>Was soll sich ändern?</strong><p>Zum Beispiel: „Erstelle eine 5-teilige Präsentation über Photosynthese für Klasse 7.“</p></div>:aiMessages.map((message,index)=><div className={`ai-message ${message.role}`} key={`${message.role}-${index}`}><span>{message.role==="user"?"Du":"KI"}</span><p>{message.text}</p></div>)}{aiBusy&&<div className="ai-thinking"><LoaderCircle className="spin" size={15}/> Folien werden erstellt …</div>}</div><form className="ai-compose" onSubmit={event=>void askAi(event)}><textarea value={aiInput} onChange={event=>setAiInput(event.target.value)} placeholder="Beschreibe deine Folienänderung …" rows={3} disabled={aiBusy}/><button className="button primary" disabled={aiBusy||!aiInput.trim()}><Send size={15}/> {aiBusy?"Wird erstellt…":"Anwenden"}</button></form>{aiError&&<p className="ai-error" role="alert">{aiError}</p>}<p className="ai-disclaimer">KI-Ergebnisse können Fehler enthalten. Bitte prüfe jede Folie vor dem Unterricht.</p></aside>}
       <aside className={`inspector ${inspectorOpen?"is-open":""}`}><div className="inspector-heading"><div><small>{selected?"AUSGEWÄHLT":"AKTUELLE FOLIE"}</small><strong>{selected?"Element gestalten":"Folie gestalten"}</strong></div><button className="icon-button mini-icon inspector-close" aria-label="Eigenschaften schließen" onClick={()=>{if(selected)setSelectedId("");else setInspectorOpen(false);}}><X size={16}/></button></div>
         {selected?<div className="inspector-content">
           <div className="property-tag">{({text:"TEXT",image:"BILD",video:"VIDEO",shape:"FORM",table:"TABELLE",chart:"DIAGRAMM"} as const)[selected.kind]}</div>
