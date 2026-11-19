@@ -86,8 +86,24 @@ async function callGroq(apiKey: string, model: string, messages: unknown[], maxT
     body: JSON.stringify({ model: requestedModel, messages, temperature: 0.2, max_completion_tokens: maxTokens, response_format: { type: "json_object" } }),
     signal: AbortSignal.timeout(45_000),
   });
-  let response = await request(model);
-  if (response.status === 404 && fallbackModel && fallbackModel !== model) response = await request(fallbackModel);
+  const candidates = [model, fallbackModel, ...(fallbackModel ? ["openai/gpt-oss-20b", "llama-3.1-8b-instant"] : [])].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+  let selectedModel = model;
+  try {
+    const modelsResponse = await fetch("https://api.groq.com/openai/v1/models", { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(10_000) });
+    if (modelsResponse.ok) {
+      const models = await modelsResponse.json() as { data?: Array<{ id?: unknown }> };
+      const available = new Set((models.data ?? []).map((entry) => typeof entry.id === "string" ? entry.id : ""));
+      selectedModel = candidates.find((candidate) => available.has(candidate)) ?? model;
+    }
+  } catch { /* The completion request below provides the actionable error. */ }
+  let response = await request(selectedModel);
+  if (response.status === 404) {
+    for (const candidate of candidates) {
+      if (candidate === selectedModel) continue;
+      response = await request(candidate);
+      if (response.ok || response.status !== 404) { selectedModel = candidate; break; }
+    }
+  }
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) throw new Error("Groq hat den gespeicherten Schlüssel abgelehnt. Bitte hinterlege einen gültigen Schlüssel.");
     if (response.status === 429) throw new Error("Das Groq-Limit ist erreicht. Bitte versuche es später erneut.");
@@ -96,7 +112,7 @@ async function callGroq(apiKey: string, model: string, messages: unknown[], maxT
       const errorBody = await response.json() as { error?: { message?: unknown } };
       detail = typeof errorBody.error?.message === "string" ? errorBody.error.message.slice(0, 240) : "";
     } catch { /* Groq may return a non-JSON error body. */ }
-    const usedModel = response.status === 404 && fallbackModel ? `${model} und Fallback ${fallbackModel}` : model;
+    const usedModel = response.status === 404 ? candidates.join(", ") : selectedModel;
     throw new Error(`Groq-Modell nicht verfügbar (${usedModel}).${detail ? ` Groq: ${detail}` : ` Anfrage fehlgeschlagen (HTTP ${response.status}).`}`);
   }
   const result = await response.json();
