@@ -122,6 +122,12 @@ function mergeResponseLists(existing: StudentResponse[], incoming: StudentRespon
   return [...merged.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
+function mergeParticipantLists(existing: LiveParticipant[], incoming: LiveParticipant[]): LiveParticipant[] {
+  const merged = new Map(existing.map((participant) => [participant.userId, participant]));
+  for (const participant of incoming) merged.set(participant.userId, participant);
+  return [...merged.values()].sort((a, b) => a.joinedAt.localeCompare(b.joinedAt));
+}
+
 function stableHash(value: string): number {
   let hash = 2166136261;
   for (let i = 0; i < value.length; i += 1) hash = Math.imul(hash ^ value.charCodeAt(i), 16777619);
@@ -138,6 +144,8 @@ export function LivePanel({ presentation, onClose }: Props) {
   const [session, setSession] = useState<ClassSession | null>(null);
   const [realtimeStatus, setRealtimeStatus] = useState("CONNECTING");
   const [responses, setResponses] = useState<StudentResponse[]>([]);
+  const [dataSyncError, setDataSyncError] = useState("");
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [ending, setEnding] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -184,26 +192,52 @@ export function LivePanel({ presentation, onClose }: Props) {
   useEffect(() => {
     if (!session || !hasSupabaseConfig) return;
     let active = true;
-    const refreshParticipants = async () => {
-      if (!supabase) return;
-      const { data, error: participantError } = await supabase.from("session_participants")
-        .select("user_id,nickname,joined_at").eq("session_id", session.id).order("joined_at", { ascending: true });
-      if (participantError) throw participantError;
-      if (active) setParticipants((data ?? []).map((row) => ({
-        userId: String(row.user_id), nickname: String(row.nickname || "Teilnehmer"), joinedAt: String(row.joined_at || ""),
-      })));
+    let snapshotInFlight = false;
+
+    const refreshSnapshot = async () => {
+      if (!supabase || snapshotInFlight) return;
+      snapshotInFlight = true;
+      try {
+        const [participantsResult, responsesResult] = await Promise.allSettled([
+          supabase.from("session_participants")
+            .select("user_id,nickname,joined_at")
+            .eq("session_id", session.id)
+            .order("joined_at", { ascending: true }),
+          listSessionResponses(session.id),
+        ]);
+        if (!active) return;
+
+        const syncErrors: string[] = [];
+        if (participantsResult.status === "fulfilled" && !participantsResult.value.error) {
+          const participantsFromServer = (participantsResult.value.data ?? []).map((row) => ({
+            userId: String(row.user_id),
+            nickname: String(row.nickname || "Teilnehmer"),
+            joinedAt: String(row.joined_at || ""),
+          }));
+          setParticipants((previous) => mergeParticipantLists(previous, participantsFromServer));
+        } else {
+          syncErrors.push("Teilnehmendenliste");
+        }
+
+        if (responsesResult.status === "fulfilled") {
+          setResponses((previous) => mergeResponseLists(previous, responsesResult.value));
+        } else {
+          syncErrors.push("Antworten");
+        }
+
+        setDataSyncError(syncErrors.length ? `${syncErrors.join(" und ")} konnten nicht abgeglichen werden.` : "");
+        if (!syncErrors.length) setLastSyncedAt(Date.now());
+      } finally {
+        snapshotInFlight = false;
+      }
     };
+
     setRealtimeStatus("CONNECTING");
-    void listSessionResponses(session.id)
-      .then((items) => {
-        if (active) setResponses((previous) => mergeResponseLists(previous, items));
-      })
-      .catch((e: unknown) => {
-        if (active) setError(e instanceof Error ? e.message : "Antworten konnten nicht geladen werden.");
-      });
-    void refreshParticipants().catch((e: unknown) => {
-      if (active) setError(e instanceof Error ? e.message : "Teilnehmende konnten nicht geladen werden.");
-    });
+    void refreshSnapshot();
+    const pollTimer = session.status === "ended"
+      ? undefined
+      : window.setInterval(() => void refreshSnapshot(), 3500);
+
     void listGroupAssignments(session.id).then((items) => {
       if (!active) return;
       const next: Record<string, Record<string, number>> = {};
@@ -235,25 +269,21 @@ export function LivePanel({ presentation, onClose }: Props) {
       (response) => {
         if (active) {
           update(response);
-          void refreshParticipants().catch(() => undefined);
+          void refreshSnapshot();
         }
       },
       (status) => {
         if (!active) return;
         setRealtimeStatus(status);
-        if (status === "SUBSCRIBED") {
-          void listSessionResponses(session.id).then((items) => {
-            if (active) setResponses((previous) => mergeResponseLists(previous, items));
-          }).catch(() => undefined);
-          void refreshParticipants().catch(() => undefined);
-        }
+        if (status === "SUBSCRIBED") void refreshSnapshot();
       },
     );
     return () => {
       active = false;
+      if (pollTimer !== undefined) window.clearInterval(pollTimer);
       void channel.unsubscribe();
     };
-  }, [session?.id]);
+  }, [session?.id, session?.presentationId, session?.status]);
 
   const start = useCallback(async () => {
     setBusy(true);
@@ -368,6 +398,7 @@ export function LivePanel({ presentation, onClose }: Props) {
   const visibleResponses = responses.slice(-MAX_VISIBLE_RESPONSES);
   const currentSelectedResponse = responses.find((item) => item.id === selected);
   const currentSlideResponses = current ? responses.filter((response) => response.slideId === current.id) : [];
+  const currentSlideIsInteractive = Boolean(current && ["multiple_choice", "poll", "free_text", "worksheet", "photo_task", "group_work", "mindmap", "brainstorm", "wordcloud"].includes(current.type));
   const currentQuizKey = current ? privateQuizKeys.find((item) => item.slideId === current.id) : undefined;
   const currentOptions = Array.isArray(current?.content.options) ? current.content.options.filter((item): item is string => typeof item === "string") : [];
   const optionCounts = currentOptions.map((label, index) => ({
@@ -379,6 +410,7 @@ export function LivePanel({ presentation, onClose }: Props) {
   const frequencyWords = wordFrequencies(currentSlideResponses);
   const assignment = current ? groupAssignments[current.id] : undefined;
   const assignedGroups = assignment ? [...new Set(Object.values(assignment))].sort((a, b) => a - b) : [];
+  const realtimeDisconnected = ["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(realtimeStatus);
 
   useEffect(() => {
     if (!session || session.status === "ended") return;
@@ -548,7 +580,7 @@ export function LivePanel({ presentation, onClose }: Props) {
           <i className={session?.status === "live" ? "dot green" : "dot"} />
           {session ? session.status === "live" ? "Sitzung live" : session.status === "paused" ? "Sitzung pausiert" : "Sitzung beendet" : "Nicht gestartet"}
         </div>
-        {session && <div className={`live-realtime ${realtimeStatus === "SUBSCRIBED" ? "connected" : realtimeStatus === "CHANNEL_ERROR" || realtimeStatus === "TIMED_OUT" ? "disconnected" : ""}`}><i />{realtimeStatus === "SUBSCRIBED" ? "Echtzeit verbunden" : realtimeStatus === "CHANNEL_ERROR" || realtimeStatus === "TIMED_OUT" ? "Verbindung unterbrochen" : "Verbinde…"}</div>}
+        {session && <div className={`live-realtime ${realtimeStatus === "SUBSCRIBED" ? "connected" : realtimeDisconnected ? "disconnected" : ""}`} title={realtimeDisconnected ? "Live-Push pausiert; Teilnehmende und Antworten werden zusätzlich regelmäßig abgeglichen." : undefined}><i />{realtimeStatus === "SUBSCRIBED" ? "Live-Push verbunden" : realtimeDisconnected ? "Auto-Sync aktiv" : "Verbinde…"}</div>}
         {session && <button className="icon-button live-fullscreen" onClick={() => void toggleFullscreen()} aria-label={isFullscreen ? "Vollbild verlassen" : "Vollbild"} title={isFullscreen ? "Vollbild verlassen" : "Vollbild"}>{isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}</button>}
         <button className="icon-button live-close" onClick={closeLive} aria-label="Live-Ansicht schließen"><X size={20} /></button>
       </header>
@@ -578,7 +610,7 @@ export function LivePanel({ presentation, onClose }: Props) {
         <main className="live-content">
           <section className="live-stage-column">
             <div className="live-toolbar">
-              <div className="live-heading"><span className={`live-chip ${session.status}`}><i className="dot" /> {session.status === "live" ? "LIVE" : session.status === "paused" ? "PAUSIERT" : "BEENDET"}</span><strong>{presentation.title}</strong><span className="live-audience"><Users size={15} /> {participants.length} dabei</span></div>
+              <div className="live-heading"><span className={`live-chip ${session.status}`}><i className="dot" /> {session.status === "live" ? "LIVE" : session.status === "paused" ? "PAUSIERT" : "BEENDET"}</span><strong>{presentation.title}</strong><span className="live-audience"><Users size={15} /> {participants.length} beigetreten · {currentSlideResponses.length} Antworten</span></div>
               <div className="live-session-controls">
                 {session.status !== "ended" && <button className="button secondary small-button" onClick={() => void patch({ status: session.status === "paused" ? "live" : "paused" })}>{session.status === "paused" ? <CirclePlay size={16} /> : <CirclePause size={16} />} {session.status === "paused" ? "Fortsetzen" : "Pausieren"}</button>}
                 {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
@@ -609,9 +641,34 @@ export function LivePanel({ presentation, onClose }: Props) {
 
             <section className="responses-panel">
               <div className="responses-heading">
-                <div><h3>Antworten</h3><small>{responses.length} {responses.length === 1 ? "Beitrag" : "Beiträge"}{responses.length > MAX_VISIBLE_RESPONSES ? ` · letzte ${MAX_VISIBLE_RESPONSES} angezeigt` : ""}</small></div>
-                <span className="response-count"><Users size={15} />{responses.length}</span>
+                <div><h3>Antworten & Beiträge</h3><small>{currentSlideResponses.length} auf dieser Folie · {responses.length} insgesamt</small></div>
+                <div className="live-response-meta">
+                  <span className={`live-sync-pill ${dataSyncError ? "error" : ""}`} title={dataSyncError || (lastSyncedAt ? `Letzter Abgleich ${new Date(lastSyncedAt).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Datenabgleich läuft") }><i />{dataSyncError ? "Sync prüfen" : lastSyncedAt ? "Auto-Sync" : "Verbinde…"}</span>
+                  <span className="response-count"><Users size={15} />{currentSlideResponses.length}</span>
+                </div>
               </div>
+
+              <section className="live-roster" aria-label="Teilnehmendenliste">
+                <div className="live-roster-heading"><strong>Deine Klasse</strong><span>{participants.length} beigetreten</span></div>
+                {!participants.length ? <div className="live-roster-empty"><Users size={17} /><span>Noch niemand beigetreten. Die Liste aktualisiert sich automatisch.</span></div> : (
+                  <ul className="live-roster-list">
+                    {participants.map((participant, index) => {
+                      const hasAnswered = currentSlideResponses.some((response) => response.participantId === participant.userId);
+                      const nickname = safeText(participant.nickname, 24).trim() || `Teilnehmer ${index + 1}`;
+                      const joined = new Date(participant.joinedAt);
+                      const joinedText = Number.isNaN(joined.getTime()) ? "" : `seit ${joined.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })}`;
+                      return <li key={participant.userId} className="live-roster-person">
+                        <span className={`roster-avatar avatar-${index % 6}`}>{nickname.charAt(0).toLocaleUpperCase("de-DE")}</span>
+                        <span className="roster-person-name"><strong>{nickname}</strong><small>{joinedText || "Teilnahme bestätigt"}</small></span>
+                        <span className={`roster-answer ${hasAnswered ? "answered" : currentSlideIsInteractive ? "waiting" : "joined"}`}>
+                          {hasAnswered ? <><Check size={13} /> Antwort da</> : currentSlideIsInteractive ? "Noch offen" : "Dabei"}
+                        </span>
+                      </li>;
+                    })}
+                  </ul>
+                )}
+                <small className="live-roster-note">Zeigt Beitritte zur Sitzung; die Antwortmarkierung bezieht sich auf die aktuelle Folie.</small>
+              </section>
 
               {current && (current.type === "multiple_choice" || current.type === "poll") && <section className="live-ai-panel" aria-live="polite">
                 <div className="live-ai-title"><Activity size={15} /><strong>{current.type === "multiple_choice" ? "Live-Quiz-Auswertung" : "Live-Umfrage"}</strong></div>
