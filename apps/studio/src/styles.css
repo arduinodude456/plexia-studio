@@ -726,3 +726,22 @@ body, .app-frame { background: var(--bg); color: var(--ink); }
 @media (prefers-reduced-motion: reduce) {
   .live-slide-transition { animation: none; }
 }
+
+
+/* Directional classroom camera move: the next slide flies in from the chosen direction. */
+.live-slide-frame { perspective: 1500px; }
+.live-slide-transition { transform-style: preserve-3d; will-change: transform, opacity, filter; animation: plexia-camera-forward .62s cubic-bezier(.16,1,.3,1) both; }
+.live-slide-transition.back { animation-name: plexia-camera-back; }
+@keyframes plexia-camera-forward {
+  0% { opacity: 0; filter: saturate(.72) blur(3px); transform: translate3d(13%, 18px, -180px) rotateY(-10deg) rotateZ(-1.2deg) scale(.79); }
+  46% { opacity: 1; filter: saturate(1.08) blur(0); transform: translate3d(-2.5%, -2px, 20px) rotateY(1.5deg) rotateZ(.2deg) scale(1.018); }
+  76% { transform: translate3d(.8%, 0, 0) rotateY(-.3deg) rotateZ(0) scale(.997); }
+  100% { opacity: 1; filter: none; transform: translate3d(0, 0, 0) rotateY(0) rotateZ(0) scale(1); }
+}
+@keyframes plexia-camera-back {
+  0% { opacity: 0; filter: saturate(.72) blur(3px); transform: translate3d(-13%, 18px, -180px) rotateY(10deg) rotateZ(1.2deg) scale(.79); }
+  46% { opacity: 1; filter: saturate(1.08) blur(0); transform: translate3d(2.5%, -2px, 20px) rotateY(-1.5deg) rotateZ(-.2deg) scale(1.018); }
+  76% { transform: translate3d(-.8%, 0, 0) rotateY(.3deg) rotateZ(0) scale(.997); }
+  100% { opacity: 1; filter: none; transform: translate3d(0, 0, 0) rotateY(0) rotateZ(0) scale(1); }
+}
+@media (prefers-reduced-motion: reduce) { .live-slide-transition, .live-slide-transition.back { animation: none; } }

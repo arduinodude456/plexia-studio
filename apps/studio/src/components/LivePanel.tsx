@@ -466,6 +466,9 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
 
   const currentIndex = session?.currentSlideIndex ?? 0;
   const current = presentation.slides[currentIndex];
+  const previousSlideIndex = useRef(currentIndex);
+  const slideDirection = currentIndex < previousSlideIndex.current ? "back" : "forward";
+  useEffect(() => { previousSlideIndex.current = currentIndex; }, [currentIndex]);
   const visibleResponses = responses.slice(-MAX_VISIBLE_RESPONSES);
   const currentSelectedResponse = responses.find((item) => item.id === selected);
   const currentSlideResponses = current ? responses.filter((response) => response.slideId === current.id) : [];
@@ -691,7 +694,7 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
                 {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending || updatingSession}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
               </div>
             </div>
-            <div className="live-slide-frame">{current && <div key={`${session.id}-${current.id}`} className="live-slide-transition"><SlideStage slide={current} preview /></div>}</div>
+            <div className="live-slide-frame">{current && <div key={`${session.id}-${current.id}`} className={`live-slide-transition ${slideDirection}`}><SlideStage slide={current} preview /></div>}</div>
             <div className="live-slide-nav" aria-label="Foliennavigation">
               <button className="button secondary" disabled={currentIndex <= 0 || session.status === "ended" || updatingSession} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
               <span>Folie <b>{currentIndex + 1}</b> / {presentation.slides.length}</span>
