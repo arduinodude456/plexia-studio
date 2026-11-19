@@ -61,6 +61,12 @@ export async function signInTeacher(email: string, password: string) {
   const client = requireSupabase();
   const { data, error } = await client.auth.signInWithPassword({ email, password });
   if (error) throw error;
+  const { data: profile, error: profileError } = await client.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle();
+  if (profileError) throw profileError;
+  if (profile?.role !== "teacher") {
+    await client.auth.signOut();
+    throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
+  }
   return data.user;
 }
 
@@ -81,6 +87,14 @@ export async function getCurrentUser() {
   if (!supabase) return null;
   const { data, error } = await supabase.auth.getUser();
   if (error && error.name !== "AuthSessionMissingError") throw error;
+  if (data.user) {
+    const { data: profile, error: profileError } = await supabase.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle();
+    if (profileError) throw profileError;
+    if (profile?.role !== "teacher") {
+      await supabase.auth.signOut();
+      throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
+    }
+  }
   return data.user;
 }
 
