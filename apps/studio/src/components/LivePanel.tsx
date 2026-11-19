@@ -691,8 +691,8 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
                 {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending || updatingSession}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
               </div>
             </div>
-            <div className="live-slide-frame">{current && <SlideStage slide={current} preview />}</div>
-            <div className="live-slide-nav">
+            <div className="live-slide-frame">{current && <div key={`${session.id}-${current.id}`} className="live-slide-transition"><SlideStage slide={current} preview /></div>}</div>
+            <div className="live-slide-nav" aria-label="Foliennavigation">
               <button className="button secondary" disabled={currentIndex <= 0 || session.status === "ended" || updatingSession} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
               <span>Folie <b>{currentIndex + 1}</b> / {presentation.slides.length}</span>
               <button className="button primary" disabled={currentIndex >= presentation.slides.length - 1 || session.status === "ended" || updatingSession} onClick={() => void patch({ currentSlideIndex: currentIndex + 1 })}>Weiter →</button>
