@@ -56,7 +56,12 @@ function mapGroupAssignment(row: Record<string, unknown>): SessionGroupAssignmen
     assignedAt: String(row.assigned_at ?? new Date().toISOString()),
   };
 }
-
+function withTimeout<T>(promise: PromiseLike<T>, message: string, milliseconds = 10000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), milliseconds);
+    Promise.resolve(promise).then((value) => { window.clearTimeout(timer); resolve(value); }, (error: unknown) => { window.clearTimeout(timer); reject(error); });
+  });
+}
 export async function signInTeacher(email: string, password: string) {
   const client = requireSupabase();
   const { data, error } = await client.auth.signInWithPassword({ email, password });
@@ -85,10 +90,10 @@ export async function signOut() {
 
 export async function getCurrentUser() {
   if (!supabase) return null;
-  const { data, error } = await supabase.auth.getUser();
+  const { data, error } = await withTimeout(supabase.auth.getUser(), "Die Supabase-Verbindung antwortet nicht. Bitte prüfe deine Internetverbindung und lade die Seite erneut.");
   if (error && error.name !== "AuthSessionMissingError") throw error;
   if (data.user) {
-    const { data: profile, error: profileError } = await supabase.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle();
+    const { data: profile, error: profileError } = await withTimeout(supabase.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle(), "Das Lehrkraftprofil konnte nicht geladen werden. Bitte lade die Seite erneut.");
     if (profileError) throw profileError;
     if (profile?.role !== "teacher") {
       await supabase.auth.signOut();
@@ -100,7 +105,7 @@ export async function getCurrentUser() {
 
 export async function listPresentations(): Promise<Presentation[]> {
   const client = requireSupabase();
-  const { data, error } = await client.from("presentations").select("data").order("updated_at", { ascending: false });
+  const { data, error } = await withTimeout(client.from("presentations").select("data").order("updated_at", { ascending: false }), "Die Präsentationen konnten nicht geladen werden. Bitte prüfe die Supabase-Verbindung.");
   if (error) throw error;
   return (data ?? []).map((row: { data: Presentation }) => row.data);
 }
