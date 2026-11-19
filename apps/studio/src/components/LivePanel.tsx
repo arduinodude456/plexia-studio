@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   Check,
@@ -147,6 +147,8 @@ export function LivePanel({ presentation, onClose }: Props) {
   const [dataSyncError, setDataSyncError] = useState("");
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  const [updatingSession, setUpdatingSession] = useState(false);
+  const sessionUpdateLock = useRef(false);
   const [ending, setEnding] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState("");
@@ -301,23 +303,29 @@ export function LivePanel({ presentation, onClose }: Props) {
   }, [presentation]);
 
   async function patch(p: Partial<Pick<ClassSession, "status" | "currentSlideIndex" | "activityStatus">>) {
-    if (!session) return;
+    if (!session || sessionUpdateLock.current || ending) return;
+    sessionUpdateLock.current = true;
+    setUpdatingSession(true);
+    setError("");
     try {
-      await updateClassSession(session.id, p);
-      setSession({ ...session, ...p });
+      const updated = await updateClassSession(session.id, p);
+      setSession(updated);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Die Sitzung konnte nicht aktualisiert werden.");
+    } finally {
+      sessionUpdateLock.current = false;
+      setUpdatingSession(false);
     }
   }
 
   async function endSession() {
-    if (!session || session.status === "ended" || ending) return;
+    if (!session || session.status === "ended" || ending || sessionUpdateLock.current) return;
     if (!window.confirm("Sitzung jetzt wirklich beenden? Teilnehmende können danach keine Antworten mehr senden.")) return;
     setEnding(true);
     setError("");
     try {
-      await updateClassSession(session.id, { status: "ended", activityStatus: "ended" });
-      setSession({ ...session, status: "ended", activityStatus: "ended" });
+      const updated = await updateClassSession(session.id, { status: "ended", activityStatus: "ended" });
+      setSession(updated);
       setNotice("Die Live-Sitzung wurde beendet.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Die Sitzung konnte nicht beendet werden.");
@@ -612,19 +620,19 @@ export function LivePanel({ presentation, onClose }: Props) {
             <div className="live-toolbar">
               <div className="live-heading"><span className={`live-chip ${session.status}`}><i className="dot" /> {session.status === "live" ? "LIVE" : session.status === "paused" ? "PAUSIERT" : "BEENDET"}</span><strong>{presentation.title}</strong><span className="live-audience"><Users size={15} /> {participants.length} beigetreten · {currentSlideResponses.length} Antworten</span></div>
               <div className="live-session-controls">
-                {session.status !== "ended" && <button className="button secondary small-button" onClick={() => void patch({ status: session.status === "paused" ? "live" : "paused" })}>{session.status === "paused" ? <CirclePlay size={16} /> : <CirclePause size={16} />} {session.status === "paused" ? "Fortsetzen" : "Pausieren"}</button>}
-                {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
+                {session.status !== "ended" && <button className="button secondary small-button" onClick={() => void patch({ status: session.status === "paused" ? "live" : "paused" })} disabled={updatingSession || ending}>{session.status === "paused" ? <CirclePlay size={16} /> : <CirclePause size={16} />} {session.status === "paused" ? "Fortsetzen" : "Pausieren"}</button>}
+                {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending || updatingSession}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
               </div>
             </div>
             <div className="live-slide-frame">{current && <SlideStage slide={current} preview />}</div>
             <div className="live-slide-nav">
-              <button className="button secondary" disabled={currentIndex <= 0 || session.status === "ended"} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
+              <button className="button secondary" disabled={currentIndex <= 0 || session.status === "ended" || updatingSession} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
               <span>Folie <b>{currentIndex + 1}</b> / {presentation.slides.length}</span>
-              <button className="button primary" disabled={currentIndex >= presentation.slides.length - 1 || session.status === "ended"} onClick={() => void patch({ currentSlideIndex: currentIndex + 1 })}>Weiter →</button>
+              <button className="button primary" disabled={currentIndex >= presentation.slides.length - 1 || session.status === "ended" || updatingSession} onClick={() => void patch({ currentSlideIndex: currentIndex + 1 })}>Weiter →</button>
             </div>
             <div className="activity-control">
               <div className="activity-title"><Activity size={18} /><div><strong>Interaktion</strong><small>{session.activityStatus === "running" ? "Aktivität läuft" : "Aktivität pausiert oder wartet"}</small></div></div>
-              <button className={`button ${session.activityStatus === "running" ? "secondary" : "mint-button"}`} disabled={session.status === "ended"} onClick={() => void patch({ activityStatus: session.activityStatus === "running" ? "paused" : "running" })}>{session.activityStatus === "running" ? <><CirclePause size={16} /> Aktivität pausieren</> : <><CirclePlay size={16} /> Aktivität starten</>}</button>
+              <button className={`button ${session.activityStatus === "running" ? "secondary" : "mint-button"}`} disabled={session.status === "ended" || updatingSession || ending} onClick={() => void patch({ activityStatus: session.activityStatus === "running" ? "paused" : "running" })}>{session.activityStatus === "running" ? <><CirclePause size={16} /> Aktivität pausieren</> : <><CirclePlay size={16} /> Aktivität starten</>}</button>
             </div>
           </section>
 

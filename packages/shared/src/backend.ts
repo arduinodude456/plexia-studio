@@ -245,15 +245,17 @@ export async function createClassSession(presentation: Presentation): Promise<Cl
   return mapSession(data as Record<string, unknown>);
 }
 
-export async function updateClassSession(sessionId: string, patch: Partial<Pick<ClassSession, "status" | "currentSlideIndex" | "activityStatus">>): Promise<void> {
+export async function updateClassSession(sessionId: string, patch: Partial<Pick<ClassSession, "status" | "currentSlideIndex" | "activityStatus">>): Promise<ClassSession> {
   const client = requireSupabase();
   const values: Record<string, unknown> = {};
   if (patch.status !== undefined) values.status = patch.status;
   if (patch.currentSlideIndex !== undefined) values.current_slide_index = patch.currentSlideIndex;
   if (patch.activityStatus !== undefined) values.activity_status = patch.activityStatus;
   values.updated_at = new Date().toISOString();
-  const { error } = await client.from("class_sessions").update(values).eq("id", sessionId);
+  const { data, error } = await client.from("class_sessions").update(values).eq("id", sessionId)
+    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at").single();
   if (error) throw error;
+  return mapSession(data as Record<string, unknown>);
 }
 
 export async function getSessionBundle(sessionId: string): Promise<SessionBundle> {
