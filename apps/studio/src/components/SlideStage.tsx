@@ -96,7 +96,7 @@ function SlideContentPreview({ slide }: { slide: PlexiaSlide }) {
   return <div className={`slide-content-preview preview-${slide.type}`}>
     <span className="slide-content-type">{slide.type === "multiple_choice" ? "QUIZ" : slide.type === "poll" ? "UMFRAGE" : slide.type === "group_work" ? "GRUPPENARBEIT" : "AKTIVITÄT"}</span>
     {prompt && <p className="slide-content-prompt">{prompt}</p>}
-    {(slide.type === "multiple_choice" || slide.type === "poll") && options.length > 0 && <div className="slide-content-options">{options.map((option, index) => <div className="slide-content-option" key={`${option}-${index}`}><b>{String.fromCharCode(65 + index)}</b><span>{option}</span></div>)}</div>}
+    {(slide.type === "multiple_choice" || slide.type === "poll") && options.length > 0 && <div className={`slide-content-options ${slide.type === "multiple_choice" ? "kahoot-preview-options" : ""}`}>{options.map((option, index) => <div className={`slide-content-option ${slide.type === "multiple_choice" ? "kahoot-preview-option" : ""}`} key={`${option}-${index}`}><b>{String.fromCharCode(65 + index)}</b><span>{option}</span></div>)}</div>}
     {slide.type === "free_text" && <div className="slide-content-input-placeholder">Schülerantwort …</div>}
     {slide.type === "worksheet" && <div className="slide-content-input-placeholder">Arbeitsblatt-Antwort …</div>}
     {slide.type === "photo_task" && <div className="slide-content-input-placeholder">Foto oder Beschreibung abgeben …</div>}

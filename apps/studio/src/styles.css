@@ -745,3 +745,163 @@ body, .app-frame { background: var(--bg); color: var(--ink); }
   100% { opacity: 1; filter: none; transform: translate3d(0, 0, 0) rotateY(0) rotateZ(0) scale(1); }
 }
 @media (prefers-reduced-motion: reduce) { .live-slide-transition, .live-slide-transition.back { animation: none; } }
+
+
+/* Interaktive Folien: Kahoot-ähnliche Auswahlkarten und live eingeblendete Beiträge. */
+.slide-content-options.kahoot-preview-options {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.slide-content-option.kahoot-preview-option {
+  min-height: 46px;
+  padding: 9px 11px;
+  border: 0;
+  border-radius: 9px;
+  color: #fff;
+  box-shadow: 0 3px 0 rgba(34, 28, 75, .16);
+  font-weight: 800;
+}
+.slide-content-option.kahoot-preview-option:nth-child(4n + 1) { background: #e64f63; }
+.slide-content-option.kahoot-preview-option:nth-child(4n + 2) { background: #2d78cf; }
+.slide-content-option.kahoot-preview-option:nth-child(4n + 3) { background: #d99a22; }
+.slide-content-option.kahoot-preview-option:nth-child(4n + 4) { background: #269b7a; }
+.slide-content-option.kahoot-preview-option b {
+  width: 25px;
+  height: 25px;
+  border-radius: 7px;
+  color: currentColor;
+  background: rgba(255, 255, 255, .2);
+  font-size: 12px;
+}
+.slide-content-option.kahoot-preview-option span { color: #fff; }
+
+.live-stage-with-response-overlay {
+  position: relative;
+  width: 100%;
+  max-width: 1180px;
+}
+.live-stage-with-response-overlay > .slide-stage { width: 100%; }
+.live-slide-response-overlay {
+  position: absolute;
+  z-index: 8;
+  inset: 36% 4% 4%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  pointer-events: none;
+  color: #25213e;
+}
+.live-slide-response-badge {
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, .75);
+  border-radius: 999px;
+  color: #423792;
+  background: rgba(255, 255, 255, .9);
+  box-shadow: 0 4px 13px rgba(48, 39, 95, .12);
+  font: 800 clamp(7px, .85vw, 12px) Manrope, sans-serif;
+  letter-spacing: .02em;
+}
+.live-slide-response-badge i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #20a88a;
+  box-shadow: 0 0 0 4px rgba(32, 168, 138, .15);
+}
+.live-wordcloud-canvas {
+  flex: 1;
+  display: flex;
+  align-content: center;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: clamp(3px, .6vw, 10px);
+  padding: clamp(10px, 2vw, 25px);
+  overflow: hidden;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, .72);
+  box-shadow: 0 7px 22px rgba(49, 41, 98, .12);
+}
+.live-wordcloud-word {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 8px;
+  color: #5646bf;
+  font: 800 clamp(13px, 2.4vw, 34px)/1.05 Manrope, sans-serif;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, .7);
+}
+.live-wordcloud-word:nth-child(4n + 2) { color: #168b78; }
+.live-wordcloud-word:nth-child(4n + 3) { color: #c57d19; }
+.live-wordcloud-word:nth-child(4n + 4) { color: #d54c6a; }
+.live-wordcloud-word.word-size-1 { font-size: clamp(11px, 1.3vw, 19px); opacity: .82; }
+.live-wordcloud-word.word-size-2 { font-size: clamp(14px, 1.8vw, 26px); }
+.live-wordcloud-word.word-size-3 { font-size: clamp(18px, 2.3vw, 33px); }
+.live-wordcloud-word.word-size-4,
+.live-wordcloud-word.word-size-5 { font-size: clamp(22px, 3.2vw, 46px); }
+.live-slide-response-empty {
+  align-self: center;
+  margin: auto;
+  padding: 12px 17px;
+  border-radius: 10px;
+  color: #746e8b;
+  background: rgba(255, 255, 255, .82);
+  font-size: clamp(9px, 1vw, 14px);
+}
+.live-mindmap-canvas {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, .64);
+  box-shadow: 0 7px 22px rgba(49, 41, 98, .12);
+}
+.live-mindmap-centre,
+.live-mindmap-node {
+  position: absolute;
+  z-index: 2;
+  transform: translate(-50%, -50%);
+  display: block;
+  max-width: 24%;
+  padding: clamp(5px, .7vw, 10px) clamp(7px, 1vw, 14px);
+  border-radius: 999px;
+  overflow: hidden;
+  color: #fff;
+  background: #5b45c8;
+  box-shadow: 0 4px 10px rgba(49, 41, 98, .18);
+  font: 800 clamp(8px, 1vw, 14px)/1.2 Manrope, sans-serif;
+  text-align: center;
+  text-overflow: ellipsis;
+}
+.live-mindmap-centre {
+  z-index: 3;
+  max-width: 27%;
+  padding: clamp(10px, 1.3vw, 18px) clamp(12px, 1.8vw, 24px);
+  background: #4f3cae;
+  font-size: clamp(10px, 1.35vw, 20px);
+}
+.live-mindmap-node:nth-of-type(4n + 2) { background: #218e7b; }
+.live-mindmap-node:nth-of-type(4n + 3) { background: #cf8b1d; }
+.live-mindmap-node:nth-of-type(4n + 4) { background: #d15470; }
+.live-mindmap-branch {
+  position: absolute;
+  z-index: 1;
+  height: 2px;
+  transform-origin: left center;
+  background: rgba(91, 69, 200, .36);
+}
+@media (max-width: 600px) {
+  .slide-content-options.kahoot-preview-options { gap: 6px; }
+  .slide-content-option.kahoot-preview-option { min-height: 35px; padding: 6px; }
+  .slide-content-option.kahoot-preview-option b { width: 19px; height: 19px; font-size: 9px; }
+  .live-slide-response-overlay { inset: 39% 3% 3%; }
+  .live-mindmap-node { max-width: 29%; font-size: clamp(7px, 1.7vw, 11px); }
+  .live-mindmap-centre { max-width: 30%; font-size: clamp(8px, 1.9vw, 13px); }
+}
+.live-mindmap-node.branch-1 { background: #218e7b; }
+.live-mindmap-node.branch-2 { background: #cf8b1d; }
+.live-mindmap-node.branch-3 { background: #d15470; }
