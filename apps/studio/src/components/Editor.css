@@ -18,9 +18,21 @@
 .editor-shell .ai-sidebar-head strong { display:block; margin-top:4px; font:800 13px Manrope,sans-serif; }
 .editor-shell .ai-eyebrow { display:flex; align-items:center; gap:4px; color:#6a42d1; font-size:9px; font-weight:900; letter-spacing:.11em; }
 .editor-shell .ai-sidebar-model { padding:13px 14px; border-bottom:1px solid #eeeaf4; background:#fbfaff; }
+.editor-shell .ai-provider-tabs { display:grid; grid-template-columns:1fr 1fr; gap:3px; padding:3px; margin-bottom:12px; background:#eeeaf7; border-radius:8px; }
+.editor-shell .ai-provider-tabs button { border:0; border-radius:6px; padding:7px 5px; color:#766d89; background:transparent; font:800 10px Manrope,sans-serif; cursor:pointer; }
+.editor-shell .ai-provider-tabs button.active { color:#4d2ca8; background:#fff; box-shadow:0 1px 4px #30205d18; }
 .editor-shell .ai-sidebar-model label { display:flex; flex-direction:column; gap:6px; color:#645b78; font-size:10px; font-weight:800; }
 .editor-shell .ai-sidebar-model select { width:100%; color:#302943; background:#fff; border:1px solid #ddd5eb; border-radius:8px; padding:9px; font-size:10px; }
 .editor-shell .ai-sidebar-model small, .editor-shell .ai-disclaimer { display:block; margin-top:7px; color:#9289a0; font-size:9px; line-height:1.45; }
+.editor-shell .ai-sidebar-model .local-download { width:100%; justify-content:center; margin-top:10px; padding:8px 10px; font-size:10px; }
+.editor-shell .ai-sidebar-model .local-download:disabled { opacity:.65; cursor:not-allowed; }
+.editor-shell .ai-local-warning { margin:9px 0 0; padding:7px 8px; color:#8b5b19; background:#fff5dc; border-radius:7px; font-size:9px; line-height:1.4; }
+.editor-shell .ai-download-progress { margin-top:10px; color:#625879; font-size:9px; }
+.editor-shell .ai-download-label { display:flex; justify-content:space-between; gap:8px; margin-bottom:5px; }
+.editor-shell .ai-download-label span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.editor-shell .ai-download-label b { color:#5b36c9; font-size:9px; }
+.editor-shell .ai-progress-track { height:6px; overflow:hidden; border-radius:99px; background:#e6e0f1; }
+.editor-shell .ai-progress-track i { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#5b36c9,#9d7ce9); transition:width .25s ease; }
 .editor-shell .ai-chat { flex:1; min-height:0; overflow:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
 .editor-shell .ai-empty { margin:auto 0; padding:16px 8px; text-align:center; color:#9389a2; }
 .editor-shell .ai-empty svg { color:#8266d9; margin-bottom:9px; }

@@ -10,6 +10,7 @@
     "test": "node --experimental-strip-types --test test/*.test.mjs"
   },
   "dependencies": {
+    "@mlc-ai/web-llm": "0.2.88",
     "@plexia/shared": "workspace:*",
     "@vitejs/plugin-react": "5.0.4",
     "lucide-react": "0.544.0",
