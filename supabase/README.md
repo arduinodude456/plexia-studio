@@ -36,6 +36,8 @@ Die Migration `20261118201343_groq_encryption_vault.sql` erzeugt einen zufällig
 
 `PLEXIA_ALLOWED_ORIGINS`, `PLEXIA_GROQ_TEXT_MODEL` und `PLEXIA_GROQ_VISION_MODEL` sind optionale Function-Variablen für strengere Origin-Filter beziehungsweise Modellwechsel. Eine abweichende Pages-Domain muss ausdrücklich zugelassen werden.
 
+Der Workflow `.github/workflows/deploy-supabase.yml` deployed Änderungen an `groq-proxy` automatisch nach `main`. Dafür müssen im GitHub-Repository die Actions-Secrets `SUPABASE_ACCESS_TOKEN` (Supabase-Access-Token) und `SUPABASE_PROJECT_REF` (bei diesem Projekt `neffuqgumcefmmbvnofg`) hinterlegt werden. Ohne diese Secrets wird nur das Frontend veröffentlicht; neue KI-Aktionen wie `list_models` und `edit_presentation` bleiben dann im laufenden Backend unbekannt.
+
 ## GitHub Pages
 
 In **beiden** öffentlichen Repositories unter **Settings → Pages → Build and deployment** die Quelle **GitHub Actions** wählen. Unter **Settings → Secrets and variables → Actions → Variables** jeweils `VITE_SUPABASE_URL` und `VITE_SUPABASE_ANON_KEY` anlegen. Der Workflow überspringt den Deploy, solange eine Variable fehlt. Die verbundene GitHub-Integration besitzt dafür keine Schreibrechte (HTTP 403), deshalb ist dieser Schritt manuell.

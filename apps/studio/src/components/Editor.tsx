@@ -170,7 +170,7 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
       const result = await groqProxy<{models?: Array<{id?: unknown;contextWindow?: unknown}>}>("list_models", {});
       const models=(result.models??[]).filter((model): model is {id:string;contextWindow?:number} => typeof model.id === "string");
       setAiModels(models); if (models.length && !models.some(model=>model.id===aiModel)) setAiModel(models[0].id);
-    } catch (error) { setAiError(error instanceof Error ? error.message : "Modelle konnten nicht geladen werden."); }
+    } catch (error) { const message=error instanceof Error?error.message:"Modelle konnten nicht geladen werden."; setAiError(message.includes("Unbekannte KI-Aktion")?"Das KI-Backend ist noch nicht aktualisiert. Bitte den Supabase-Deploy für groq-proxy ausführen.":message); }
   }
   async function askAi(event?: FormEvent) {
     event?.preventDefault(); const instruction=aiInput.trim();
@@ -182,7 +182,7 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
       const next={...result.presentation,id:doc.id,ownerId:doc.ownerId,version:1 as const,updatedAt:new Date().toISOString()};
       commit(next); setAiMessages(messages=>[...messages,{role:"assistant",text:result.summary||"Die Präsentation wurde aktualisiert. Bitte prüfe die Änderungen auf der Arbeitsfläche."}]);
       setSelectedId(""); setSlideId(next.slides[Math.min(slideIndex,next.slides.length-1)]?.id||next.slides[0].id);
-    } catch (error) { const message=error instanceof Error?error.message:"Die KI-Anfrage ist fehlgeschlagen."; setAiError(message); setAiMessages(messages=>[...messages,{role:"assistant",text:`Fehler: ${message}`}]); }
+    } catch (error) { const rawMessage=error instanceof Error?error.message:"Die KI-Anfrage ist fehlgeschlagen."; const message=rawMessage.includes("Unbekannte KI-Aktion")?"Das KI-Backend ist noch nicht aktualisiert. Bitte den Supabase-Deploy für groq-proxy ausführen.":rawMessage; setAiError(message); setAiMessages(messages=>[...messages,{role:"assistant",text:`Fehler: ${message}`}]); }
     finally { setAiBusy(false); }
   }
   useEffect(()=>{
