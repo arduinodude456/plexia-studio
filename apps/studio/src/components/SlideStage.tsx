@@ -69,6 +69,24 @@ function StageElement({ element, selected, onSelect, onPointerDown }: {
   </div>;
 }
 
+function SlideContentPreview({ slide }: { slide: PlexiaSlide }) {
+  const content = slide.content;
+  const options = Array.isArray(content.options) ? content.options.filter((item): item is string => typeof item === "string" && Boolean(item.trim())) : [];
+  const prompt = [content.question, content.prompt, content.instructions, content.body]
+    .find((value): value is string => typeof value === "string" && Boolean(value.trim())) || "";
+  if (slide.type === "standard" || slide.type === "video") return content.body ? <p className="slide-content-body">{content.body}</p> : null;
+  return <div className={`slide-content-preview preview-${slide.type}`}>
+    <span className="slide-content-type">{slide.type === "multiple_choice" ? "QUIZ" : slide.type === "poll" ? "UMFRAGE" : slide.type === "group_work" ? "GRUPPENARBEIT" : "AKTIVITÄT"}</span>
+    {prompt && <p className="slide-content-prompt">{prompt}</p>}
+    {(slide.type === "multiple_choice" || slide.type === "poll") && options.length > 0 && <div className="slide-content-options">{options.map((option, index) => <div className="slide-content-option" key={`${option}-${index}`}><b>{String.fromCharCode(65 + index)}</b><span>{option}</span></div>)}</div>}
+    {slide.type === "free_text" && <div className="slide-content-input-placeholder">Schülerantwort …</div>}
+    {slide.type === "worksheet" && <div className="slide-content-input-placeholder">Arbeitsblatt-Antwort …</div>}
+    {slide.type === "photo_task" && <div className="slide-content-input-placeholder">Foto oder Beschreibung abgeben …</div>}
+    {slide.type === "group_work" && <div className="slide-content-input-placeholder">Gruppengröße: {Number(content.groupSize) || 4} · Gruppenarbeit</div>}
+    {(slide.type === "mindmap" || slide.type === "brainstorm" || slide.type === "wordcloud") && <div className="slide-content-input-placeholder">Ideen werden hier gesammelt …</div>}
+  </div>;
+}
+
 export function SlideStage({slide, preview=false, selectedId, onSelect, onPointerDown}: {
   slide: PlexiaSlide;
   preview?: boolean;
@@ -77,7 +95,7 @@ export function SlideStage({slide, preview=false, selectedId, onSelect, onPointe
   onPointerDown?: (event: PointerEvent<HTMLDivElement>, element: SlideElement) => void;
 }) {
   return <div className={`slide-stage ${preview ? "stage-preview" : ""}`} style={{background:slide.background||"#fff"}}>
-    {slide.elements.length===0&&<div className="stage-empty"><span className="stage-empty-mark">✦</span><strong>{slide.title||"Deine Folie"}</strong><small>Elemente hinzufügen, um deine Idee zum Leben zu erwecken.</small></div>}
+    {slide.elements.length===0&&<div className="stage-empty"><span className="stage-empty-mark">✦</span><strong>{slide.title||"Deine Folie"}</strong><SlideContentPreview slide={slide}/>{!slide.content.body && ["standard", "video"].includes(slide.type) && <small>Elemente hinzufügen, um deine Idee zum Leben zu erwecken.</small>}{!slide.content.body && !["standard", "video"].includes(slide.type) && <small>Aktivität konfigurieren und anschließend live starten.</small>}</div>}
     {slide.elements.map(element=><StageElement key={element.id} element={element} selected={selectedId===element.id} onSelect={onSelect} onPointerDown={onPointerDown}/ >)}
   </div>;
 }

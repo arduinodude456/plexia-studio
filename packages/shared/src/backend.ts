@@ -97,15 +97,24 @@ export async function savePresentation(presentation: Presentation): Promise<void
   if (userError) throw userError;
   if (!userResult.user) throw new Error("Bitte melde dich an, um die Präsentation in der Cloud zu speichern.");
   const next = { ...presentation, updatedAt: new Date().toISOString() };
-  const { error } = await client.from("presentations").upsert({
+  const payload = {
     id: next.id,
     owner_id: userResult.user.id,
     title: next.title,
     description: next.description,
     data: next,
     updated_at: next.updatedAt,
-  });
-  if (error) throw error;
+  };
+  const write = () => client.from("presentations").upsert(payload, { onConflict: "id" });
+  let result = await write();
+  if (result.error && ["401", "42501", "PGRST301"].includes(String(result.error.code))) {
+    await client.auth.refreshSession();
+    result = await write();
+  }
+  if (result.error) {
+    const code = result.error.code ? ` [${result.error.code}]` : "";
+    throw new Error(`Cloudspeicherung fehlgeschlagen: ${result.error.message || "Unbekannter Supabase-Fehler"}${code}`);
+  }
 }
 
 export async function uploadPresentationMedia(presentationId: string, file: File): Promise<string> {
