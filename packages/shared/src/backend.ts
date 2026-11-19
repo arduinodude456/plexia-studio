@@ -239,7 +239,7 @@ export async function createClassSession(presentation: Presentation): Promise<Cl
     presentation_id: presentation.id,
     status: "live",
     current_slide_index: 0,
-    activity_status: "idle",
+    activity_status: "running",
   }).select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at").single();
   if (error) throw error;
   return mapSession(data as Record<string, unknown>);
