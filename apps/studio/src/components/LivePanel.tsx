@@ -21,13 +21,15 @@ import {
 import { QRCodeSVG } from "qrcode.react";
 import {
   createClassSession,
+  createSnapshotScheduler,
+  getClassSession,
+  listSessionParticipants,
   createSignedStudentPhotoUrl,
   groqProxy,
   hasSupabaseConfig,
   listGroupAssignments,
   listSessionResponses,
   requestAiEvaluation,
-  savePresentation,
   saveGroupAssignments,
   subscribeToSession,
   supabase,
@@ -36,6 +38,7 @@ import {
   type ClassSession,
   type Presentation,
   type StudentResponse,
+  type SyncedClassSession,
 } from "@plexia/shared";
 import { SlideStage } from "./SlideStage";
 import "./LivePanel.css";
@@ -43,6 +46,7 @@ import "./LivePanel.css";
 interface Props {
   presentation: Presentation;
   onClose: () => void;
+  onShareResults: (slideId: string, results: SharedSlideResult[]) => Promise<void>;
 }
 
 interface ResponseSummary {
@@ -59,7 +63,7 @@ interface HandwritingReading {
 
 interface PrivateQuizKey { slideId: string; correctIndex: number; explanation: string }
 interface LiveParticipant { userId: string; nickname: string; joinedAt: string }
-interface SharedSlideResult { slideId: string; title: string; responseCount: number; options?: Array<{ label: string; count: number }> }
+export interface SharedSlideResult { slideId: string; title: string; responseCount: number; options?: Array<{ label: string; count: number }> }
 
 const MAX_VISIBLE_RESPONSES = 80;
 const publicConnectUrl = (import.meta as ImportMeta & { env: Record<string, string | undefined> }).env.VITE_CONNECT_URL;
@@ -68,7 +72,7 @@ function safeText(value: unknown, maxLength = 4000): string {
   return typeof value === "string" ? value.slice(0, maxLength) : "";
 }
 
-function stripPrivateAnswerFields(value: unknown): unknown {
+export function stripPrivateAnswerFields(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripPrivateAnswerFields);
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(Object.entries(value as Record<string, unknown>)
@@ -116,18 +120,6 @@ function wordFrequencies(responses: StudentResponse[]): Array<{ word: string; co
   return [...counts].map(([word, count]) => ({ word, count })).sort((a, b) => b.count - a.count || a.word.localeCompare(b.word, "de")).slice(0, 40);
 }
 
-function mergeResponseLists(existing: StudentResponse[], incoming: StudentResponse[]): StudentResponse[] {
-  const merged = new Map(existing.map((response) => [response.id, response]));
-  for (const response of incoming) merged.set(response.id, response);
-  return [...merged.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-}
-
-function mergeParticipantLists(existing: LiveParticipant[], incoming: LiveParticipant[]): LiveParticipant[] {
-  const merged = new Map(existing.map((participant) => [participant.userId, participant]));
-  for (const participant of incoming) merged.set(participant.userId, participant);
-  return [...merged.values()].sort((a, b) => a.joinedAt.localeCompare(b.joinedAt));
-}
-
 function stableHash(value: string): number {
   let hash = 2166136261;
   for (let i = 0; i < value.length; i += 1) hash = Math.imul(hash ^ value.charCodeAt(i), 16777619);
@@ -140,8 +132,12 @@ function buildGroupAssignment(sessionId: string, slideId: string, participants: 
   return Object.fromEntries(shuffled.map((participant, index) => [participant.userId, (index % numberOfGroups) + 1]));
 }
 
-export function LivePanel({ presentation, onClose }: Props) {
-  const [session, setSession] = useState<ClassSession | null>(null);
+export function LivePanel({ presentation, onClose, onShareResults }: Props) {
+  const [session, setSession] = useState<SyncedClassSession | null>(null);
+  const storageKey = `plexia.studio.live.${presentation.id}`;
+  const [restoring, setRestoring] = useState(true);
+  const [restoreError, setRestoreError] = useState("");
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
   const [realtimeStatus, setRealtimeStatus] = useState("CONNECTING");
   const [responses, setResponses] = useState<StudentResponse[]>([]);
   const [dataSyncError, setDataSyncError] = useState("");
@@ -149,11 +145,17 @@ export function LivePanel({ presentation, onClose }: Props) {
   const [busy, setBusy] = useState(false);
   const [updatingSession, setUpdatingSession] = useState(false);
   const sessionUpdateLock = useRef(false);
+  const requestSnapshot = useRef<(invalidate?: boolean) => void>(() => {});
+  const [isOnline, setIsOnline] = useState(() => navigator.onLine);
   const [ending, setEnding] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [selected, setSelected] = useState("");
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const reviewLock = useRef(false);
   const [evaluating, setEvaluating] = useState("");
   const [score, setScore] = useState("");
   const [feedback, setFeedback] = useState("");
@@ -184,7 +186,38 @@ export function LivePanel({ presentation, onClose }: Props) {
   const [groupAssignments, setGroupAssignments] = useState<Record<string, Record<string, number>>>({});
   const [groupsForSlide, setGroupsForSlide] = useState("");
   const [sharingResults, setSharingResults] = useState(false);
+  const sharingResultsLock = useRef(false);
   const [shareNotice, setShareNotice] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    let savedId = "";
+    try { savedId = sessionStorage.getItem(storageKey) || ""; } catch { /* no storage */ }
+    if (!savedId || !hasSupabaseConfig) { setRestoring(false); return; }
+    setRestoring(true);
+    setRestoreError("");
+    void getClassSession(savedId).then((restored) => {
+      if (!active) return;
+      if (restored.presentationId !== presentation.id) throw new Error("Die gespeicherte Sitzung gehört zu einer anderen Präsentation.");
+      setSession(restored);
+      setNotice(restored.status === "ended" ? "Die gespeicherte Sitzung ist beendet." : "Die bestehende Sitzung wurde wiederhergestellt.");
+    }).catch((e: unknown) => {
+      if (active) setRestoreError(e instanceof Error ? e.message : "Die gespeicherte Sitzung konnte nicht wiederhergestellt werden.");
+    }).finally(() => { if (active) setRestoring(false); });
+    return () => { active = false; };
+  }, [storageKey, presentation.id, restoreAttempt]);
+
+  function forgetSavedSession() {
+    if (sharingResultsLock.current) return;
+    try { sessionStorage.removeItem(storageKey); } catch { /* no storage */ }
+    setRestoreError("");
+    setSession(null);
+    setParticipants([]);
+    setResponses([]);
+    setGroupAssignments({});
+    setLastSyncedAt(null);
+    setDataSyncError("");
+  }
 
   const update = (response: StudentResponse) =>
     setResponses((prev) => (prev.some((item) => item.id === response.id)
@@ -194,67 +227,63 @@ export function LivePanel({ presentation, onClose }: Props) {
   useEffect(() => {
     if (!session || !hasSupabaseConfig) return;
     let active = true;
-    let snapshotInFlight = false;
-
-    const refreshSnapshot = async () => {
-      if (!supabase || snapshotInFlight) return;
-      snapshotInFlight = true;
-      try {
-        const [participantsResult, responsesResult] = await Promise.allSettled([
-          supabase.from("session_participants")
-            .select("user_id,nickname,joined_at")
-            .eq("session_id", session.id)
-            .order("joined_at", { ascending: true }),
-          listSessionResponses(session.id),
-        ]);
-        if (!active) return;
-
-        const syncErrors: string[] = [];
-        if (participantsResult.status === "fulfilled" && !participantsResult.value.error) {
-          const participantsFromServer = (participantsResult.value.data ?? []).map((row) => ({
-            userId: String(row.user_id),
-            nickname: String(row.nickname || "Teilnehmer"),
-            joinedAt: String(row.joined_at || ""),
-          }));
-          setParticipants((previous) => mergeParticipantLists(previous, participantsFromServer));
-        } else {
-          syncErrors.push("Teilnehmendenliste");
-        }
-
-        if (responsesResult.status === "fulfilled") {
-          setResponses((previous) => mergeResponseLists(previous, responsesResult.value));
-        } else {
-          syncErrors.push("Antworten");
-        }
-
-        setDataSyncError(syncErrors.length ? `${syncErrors.join(" und ")} konnten nicht abgeglichen werden.` : "");
-        if (!syncErrors.length) setLastSyncedAt(Date.now());
-      } finally {
-        snapshotInFlight = false;
-      }
-    };
-
-    setRealtimeStatus("CONNECTING");
-    void refreshSnapshot();
-    const pollTimer = session.status === "ended"
-      ? undefined
-      : window.setInterval(() => void refreshSnapshot(), 3500);
-
-    void listGroupAssignments(session.id).then((items) => {
-      if (!active) return;
-      const next: Record<string, Record<string, number>> = {};
-      for (const item of items) (next[item.slideId] ??= {})[item.userId] = item.groupNumber;
-      setGroupAssignments(next);
-    }).catch((e: unknown) => {
-      if (active) setError(e instanceof Error ? e.message : "Gruppenzuteilungen konnten nicht geladen werden.");
+    const sessionId = session.id;
+    const scheduler = createSnapshotScheduler(async (isCurrent) => {
+      const [sessionResult, participantsResult, responsesResult, assignmentsResult] = await Promise.allSettled([
+        getClassSession(sessionId), listSessionParticipants(sessionId), listSessionResponses(sessionId), listGroupAssignments(sessionId),
+      ]);
+      if (!isCurrent()) return;
+      const errors: string[] = [];
+      if (sessionResult.status === "fulfilled") {
+        // Never install a read which overlapped a local command.
+        if (!sessionUpdateLock.current) setSession(sessionResult.value);
+      } else errors.push("Sitzungsstatus");
+      if (participantsResult.status === "fulfilled") {
+        setParticipants([...new Map(participantsResult.value.map((item) => [item.userId, item])).values()]);
+      } else errors.push("Teilnehmendenliste");
+      if (responsesResult.status === "fulfilled") {
+        setResponses([...new Map(responsesResult.value.map((item) => [item.id, item])).values()]);
+      } else errors.push("Antworten");
+      if (assignmentsResult.status === "fulfilled") {
+        const next: Record<string, Record<string, number>> = {};
+        for (const item of assignmentsResult.value) (next[item.slideId] ??= {})[item.userId] = item.groupNumber;
+        setGroupAssignments(next);
+      } else errors.push("Gruppenzuteilungen");
+      setDataSyncError(errors.length ? `${errors.join(", ")} konnten nicht abgeglichen werden. Erneuter Versuch läuft.` : "");
+      if (!errors.length) setLastSyncedAt(Date.now());
     });
+    requestSnapshot.current = scheduler.request;
+    setRealtimeStatus("CONNECTING");
+    const channel = subscribeToSession(
+      sessionId,
+      () => scheduler.request(),
+      () => scheduler.request(),
+      (status) => {
+        if (!active) return;
+        setRealtimeStatus(status);
+        // Close the subscribe/snapshot gap and repair missed events after reconnect.
+        if (status === "SUBSCRIBED") scheduler.request();
+      },
+      () => scheduler.request(),
+    );
+    const pollTimer = window.setInterval(() => scheduler.request(false), 3500);
+    const refreshOnResume = () => {
+      setIsOnline(navigator.onLine);
+      if (navigator.onLine && document.visibilityState === "visible") scheduler.request();
+    };
+    window.addEventListener("online", refreshOnResume);
+    window.addEventListener("offline", refreshOnResume);
+    window.addEventListener("focus", refreshOnResume);
+    document.addEventListener("visibilitychange", refreshOnResume);
+    scheduler.request();
+
     if (supabase) {
       void supabase.from("teacher_quiz_keys").select("slide_id,correct_index,explanation")
         .eq("presentation_id", session.presentationId)
         .then(({ data, error: keyError }) => {
           if (!active) return;
           if (keyError) {
-            setQuizKeyNotice("Private Quiz-Schlüssel nicht verfügbar. Wende die neue Lehrer-Schlüssel-Migration an und prüfe die Lehrkraft-RLS.");
+            setQuizKeyNotice("Private Quiz-Schlüssel nicht verfügbar. Prüfe die Datenbankkonfiguration und die Lehrkraft-RLS.");
             return;
           }
           setPrivateQuizKeys((data ?? []).map((row) => ({
@@ -263,29 +292,18 @@ export function LivePanel({ presentation, onClose }: Props) {
           setQuizKeyNotice("");
         });
     }
-    const channel = subscribeToSession(
-      session.id,
-      (next) => {
-        if (active) setSession(next);
-      },
-      (response) => {
-        if (active) {
-          update(response);
-          void refreshSnapshot();
-        }
-      },
-      (status) => {
-        if (!active) return;
-        setRealtimeStatus(status);
-        if (status === "SUBSCRIBED") void refreshSnapshot();
-      },
-    );
     return () => {
       active = false;
-      if (pollTimer !== undefined) window.clearInterval(pollTimer);
-      void channel.unsubscribe();
+      scheduler.close();
+      requestSnapshot.current = () => {};
+      window.clearInterval(pollTimer);
+      window.removeEventListener("online", refreshOnResume);
+      window.removeEventListener("offline", refreshOnResume);
+      window.removeEventListener("focus", refreshOnResume);
+      document.removeEventListener("visibilitychange", refreshOnResume);
+      if (supabase) void supabase.removeChannel(channel);
     };
-  }, [session?.id, session?.presentationId, session?.status]);
+  }, [session?.id, session?.presentationId]);
 
   const start = useCallback(async () => {
     setBusy(true);
@@ -293,6 +311,7 @@ export function LivePanel({ presentation, onClose }: Props) {
     try {
       const studentSafePresentation = stripPrivateAnswerFields(presentation) as Presentation;
       const created = await createClassSession(studentSafePresentation);
+      try { sessionStorage.setItem(storageKey, created.id); } catch { /* no storage */ }
       setSession(created);
       setNotice("Sitzung gestartet. Teile den Code mit deiner Klasse.");
     } catch (e) {
@@ -300,37 +319,43 @@ export function LivePanel({ presentation, onClose }: Props) {
     } finally {
       setBusy(false);
     }
-  }, [presentation]);
+  }, [presentation, storageKey]);
 
   async function patch(p: Partial<Pick<ClassSession, "status" | "currentSlideIndex" | "activityStatus">>) {
     if (!session || sessionUpdateLock.current || ending) return;
     sessionUpdateLock.current = true;
     setUpdatingSession(true);
     setError("");
+    requestSnapshot.current();
     try {
-      const updated = await updateClassSession(session.id, p);
+      const updated = await updateClassSession(session.id, p, session.syncUpdatedAt);
       setSession(updated);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Die Sitzung konnte nicht aktualisiert werden.");
     } finally {
       sessionUpdateLock.current = false;
       setUpdatingSession(false);
+      requestSnapshot.current();
     }
   }
 
   async function endSession() {
     if (!session || session.status === "ended" || ending || sessionUpdateLock.current) return;
     if (!window.confirm("Sitzung jetzt wirklich beenden? Teilnehmende können danach keine Antworten mehr senden.")) return;
+    sessionUpdateLock.current = true;
     setEnding(true);
     setError("");
+    requestSnapshot.current();
     try {
-      const updated = await updateClassSession(session.id, { status: "ended", activityStatus: "ended" });
+      const updated = await updateClassSession(session.id, { status: "ended", activityStatus: "ended" }, session.syncUpdatedAt);
       setSession(updated);
       setNotice("Die Live-Sitzung wurde beendet.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Die Sitzung konnte nicht beendet werden.");
     } finally {
+      sessionUpdateLock.current = false;
       setEnding(false);
+      requestSnapshot.current();
     }
   }
 
@@ -380,13 +405,51 @@ export function LivePanel({ presentation, onClose }: Props) {
 
   async function saveReview() {
     const response = responses.find((item) => item.id === selected);
-    if (!response) return;
+    if (!response || reviewLock.current) return;
+    reviewLock.current = true;
+    setReviewBusy(true);
     try {
+      requestSnapshot.current();
       await updateTeacherReview(response.id, Number(score) || 0, feedback);
       update({ ...response, score: Number(score) || 0, feedback, reviewed: true });
+      requestSnapshot.current();
       setNotice("Lehrerkorrektur gespeichert.");
     } catch (e) {
+      requestSnapshot.current();
       setError(e instanceof Error ? e.message : "Korrektur konnte nicht gespeichert werden.");
+    } finally {
+      reviewLock.current = false;
+      setReviewBusy(false);
+    }
+  }
+
+  async function releaseReview(response: StudentResponse) {
+    if (!supabase || reviewLock.current || !response.reviewed) return;
+    if (!window.confirm("Bewertung und Rückmeldung entfernen und diese Antwort zur Korrektur freigeben?")) return;
+    reviewLock.current = true;
+    setReviewBusy(true);
+    setError("");
+    requestSnapshot.current();
+    try {
+      const { data, error: updateError } = await supabase.from("student_responses")
+        .update({ score: null, feedback: null, ai_evaluation: null, reviewed: false })
+        .eq("id", response.id).select("id").maybeSingle();
+      if (updateError) throw new Error(updateError.message);
+      if (!data) throw new Error("Die Antwort wurde nicht freigegeben. Bitte prüfe deine Berechtigung.");
+      setResponses((previous) => previous.map((item) => item.id === response.id
+        ? { ...item, score: null, feedback: null, reviewed: false } : item));
+      if (selectedRef.current === response.id) {
+        setScore("");
+        setFeedback("");
+        setEvaluation(null);
+      }
+      setNotice("Bewertung entfernt. Die Antwort ist zur Korrektur freigegeben.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Die Bewertung konnte nicht entfernt werden.");
+    } finally {
+      requestSnapshot.current();
+      reviewLock.current = false;
+      setReviewBusy(false);
     }
   }
 
@@ -418,7 +481,7 @@ export function LivePanel({ presentation, onClose }: Props) {
   const frequencyWords = wordFrequencies(currentSlideResponses);
   const assignment = current ? groupAssignments[current.id] : undefined;
   const assignedGroups = assignment ? [...new Set(Object.values(assignment))].sort((a, b) => a - b) : [];
-  const realtimeDisconnected = ["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(realtimeStatus);
+  const realtimeDisconnected = !isOnline || ["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(realtimeStatus);
 
   useEffect(() => {
     if (!session || session.status === "ended") return;
@@ -442,31 +505,36 @@ export function LivePanel({ presentation, onClose }: Props) {
     if (!session || !current || !supabase) return;
     const size = Math.max(2, Math.min(12, Math.trunc(groupSize) || 4));
     setGroupSize(size);
-    const { data, error: rosterError } = await supabase.from("session_participants")
-      .select("user_id,nickname,joined_at").eq("session_id", session.id).order("joined_at", { ascending: true });
-    if (rosterError) {
-      setError(rosterError.message || "Die Teilnehmerliste konnte nicht aktualisiert werden.");
+    let roster: LiveParticipant[];
+    try {
+      roster = await listSessionParticipants(session.id);
+      setParticipants(roster);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Die Teilnehmerliste konnte nicht aktualisiert werden.");
       return;
     }
-    const roster = (data ?? []).map((row) => ({ userId: String(row.user_id), nickname: String(row.nickname || "Teilnehmer"), joinedAt: String(row.joined_at || "") }));
-    setParticipants(roster);
     const nextAssignment = buildGroupAssignment(session.id, current.id, roster, size);
     try {
+      requestSnapshot.current();
       await saveGroupAssignments(session.id, current.id, nextAssignment);
       setGroupAssignments((previous) => ({ ...previous, [current.id]: nextAssignment }));
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Die Gruppenzuteilung konnte nicht gespeichert werden.");
+      requestSnapshot.current();
+      setError(e instanceof Error ? e.message : "Die Gruppenzuteilung konnte nicht gespeichert werden. Der tatsächliche Stand wird erneut geladen.");
       return;
     }
+    requestSnapshot.current();
     setGroupsForSlide(current.id);
   }
 
   async function shareAggregatedResults() {
+    if (sharingResultsLock.current) return;
     const resultsSlide = current?.type === "results" ? current : presentation.slides.find((slide) => slide.type === "results");
     if (!resultsSlide) {
       setShareNotice("Füge der Präsentation zuerst eine Ergebnisse-Folie hinzu.");
       return;
     }
+    sharingResultsLock.current = true;
     setSharingResults(true);
     setShareNotice("");
     try {
@@ -480,18 +548,12 @@ export function LivePanel({ presentation, onClose }: Props) {
           }
           return { slideId: slide.id, title: safeText(slide.title, 160), responseCount: slideResponses.length };
         });
-      const safePresentation = stripPrivateAnswerFields({
-        ...presentation,
-        slides: presentation.slides.map((slide) => slide.id === resultsSlide.id
-          ? { ...slide, content: { ...slide.content, sharedResults: safeResults } }
-          : slide),
-        updatedAt: new Date().toISOString(),
-      }) as Presentation;
-      await savePresentation(safePresentation);
+      await onShareResults(resultsSlide.id, safeResults);
       setShareNotice("Aggregierte, lösungsschlüsselfreie Resultate wurden in der Ergebnisse-Folie gespeichert und mit verbundenen Connect-Geräten synchronisiert.");
     } catch (e) {
       setShareNotice(e instanceof Error ? e.message : "Die aggregierten Resultate konnten nicht geteilt werden.");
     } finally {
+      sharingResultsLock.current = false;
       setSharingResults(false);
     }
   }
@@ -588,7 +650,7 @@ export function LivePanel({ presentation, onClose }: Props) {
           <i className={session?.status === "live" ? "dot green" : "dot"} />
           {session ? session.status === "live" ? "Sitzung live" : session.status === "paused" ? "Sitzung pausiert" : "Sitzung beendet" : "Nicht gestartet"}
         </div>
-        {session && <div className={`live-realtime ${realtimeStatus === "SUBSCRIBED" ? "connected" : realtimeDisconnected ? "disconnected" : ""}`} title={realtimeDisconnected ? "Live-Push pausiert; Teilnehmende und Antworten werden zusätzlich regelmäßig abgeglichen." : undefined}><i />{realtimeStatus === "SUBSCRIBED" ? "Live-Push verbunden" : realtimeDisconnected ? "Auto-Sync aktiv" : "Verbinde…"}</div>}
+        {session && <div className={`live-realtime ${isOnline && realtimeStatus === "SUBSCRIBED" ? "connected" : realtimeDisconnected ? "disconnected" : ""}`} title={realtimeDisconnected ? "Live-Push nicht verfügbar; bei bestehender Internetverbindung wird regelmäßig abgeglichen." : undefined}><i />{!isOnline ? "Offline" : realtimeStatus === "SUBSCRIBED" ? "Live-Push verbunden" : realtimeDisconnected ? "Live-Push unterbrochen" : "Verbinde…"}</div>}
         {session && <button className="icon-button live-fullscreen" onClick={() => void toggleFullscreen()} aria-label={isFullscreen ? "Vollbild verlassen" : "Vollbild"} title={isFullscreen ? "Vollbild verlassen" : "Vollbild"}>{isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}</button>}
         <button className="icon-button live-close" onClick={closeLive} aria-label="Live-Ansicht schließen"><X size={20} /></button>
       </header>
@@ -602,6 +664,10 @@ export function LivePanel({ presentation, onClose }: Props) {
           <div className="notice warning"><strong>Einrichtung erforderlich</strong><span>Setze <code>VITE_SUPABASE_URL</code> und <code>VITE_SUPABASE_ANON_KEY</code>, melde dich an und konfiguriere die PLEXIA-Datenbank sowie Realtime.</span></div>
           <button className="button secondary" onClick={onClose}>Zurück zum Editor</button>
         </main>
+      ) : restoring ? (
+        <main className="live-launch"><p role="status">Gespeicherte Sitzung wird geprüft …</p></main>
+      ) : restoreError ? (
+        <main className="live-launch"><div className="notice warning" role="alert"><strong>Sitzung konnte nicht wiederhergestellt werden</strong><span>{restoreError}</span></div><button className="button secondary" onClick={() => setRestoreAttempt((value) => value + 1)}>Erneut versuchen</button><button className="button secondary" onClick={forgetSavedSession}>Gespeicherte Sitzung vergessen</button><button className="text-button" onClick={onClose}>Zurück zum Editor</button></main>
       ) : !session ? (
         <main className="live-launch">
           <div className="live-preview-card">
@@ -621,6 +687,7 @@ export function LivePanel({ presentation, onClose }: Props) {
               <div className="live-heading"><span className={`live-chip ${session.status}`}><i className="dot" /> {session.status === "live" ? "LIVE" : session.status === "paused" ? "PAUSIERT" : "BEENDET"}</span><strong>{presentation.title}</strong><span className="live-audience"><Users size={15} /> {participants.length} beigetreten · {currentSlideResponses.length} Antworten</span></div>
               <div className="live-session-controls">
                 {session.status !== "ended" && <button className="button secondary small-button" onClick={() => void patch({ status: session.status === "paused" ? "live" : "paused" })} disabled={updatingSession || ending}>{session.status === "paused" ? <CirclePlay size={16} /> : <CirclePause size={16} />} {session.status === "paused" ? "Fortsetzen" : "Pausieren"}</button>}
+                {session.status === "ended" && <button className="button secondary small-button" onClick={forgetSavedSession} disabled={sharingResults}>Neue Sitzung vorbereiten</button>}
                 {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending || updatingSession}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
               </div>
             </div>
@@ -651,11 +718,12 @@ export function LivePanel({ presentation, onClose }: Props) {
               <div className="responses-heading">
                 <div><h3>Antworten & Beiträge</h3><small>{currentSlideResponses.length} auf dieser Folie · {responses.length} insgesamt</small></div>
                 <div className="live-response-meta">
-                  <span className={`live-sync-pill ${dataSyncError ? "error" : ""}`} title={dataSyncError || (lastSyncedAt ? `Letzter Abgleich ${new Date(lastSyncedAt).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Datenabgleich läuft") }><i />{dataSyncError ? "Sync prüfen" : lastSyncedAt ? "Auto-Sync" : "Verbinde…"}</span>
+                  <span className={`live-sync-pill ${dataSyncError ? "error" : ""}`} title={dataSyncError || (lastSyncedAt ? `Letzter Abgleich ${new Date(lastSyncedAt).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Datenabgleich läuft") }><i />{!isOnline ? "Offline" : dataSyncError ? "Sync prüfen" : lastSyncedAt ? "Auto-Sync" : "Verbinde…"}</span>
                   <span className="response-count"><Users size={15} />{currentSlideResponses.length}</span>
                 </div>
               </div>
 
+              {dataSyncError && <p className="live-inline-error" role="alert">{dataSyncError}</p>}
               <section className="live-roster" aria-label="Teilnehmendenliste">
                 <div className="live-roster-heading"><strong>Deine Klasse</strong><span>{participants.length} beigetreten</span></div>
                 {!participants.length ? <div className="live-roster-empty"><Users size={17} /><span>Noch niemand beigetreten. Die Liste aktualisiert sich automatisch.</span></div> : (
@@ -675,7 +743,7 @@ export function LivePanel({ presentation, onClose }: Props) {
                     })}
                   </ul>
                 )}
-                <small className="live-roster-note">Zeigt Beitritte zur Sitzung; die Antwortmarkierung bezieht sich auf die aktuelle Folie.</small>
+                <small className="live-roster-note">Zeigt Beitritte, nicht den Online-Status; die Antwortmarkierung bezieht sich auf die aktuelle Folie.</small>
               </section>
 
               {current && (current.type === "multiple_choice" || current.type === "poll") && <section className="live-ai-panel" aria-live="polite">
@@ -801,7 +869,8 @@ export function LivePanel({ presentation, onClose }: Props) {
                     {evaluation && <div className="ai-evaluation"><div className="ai-score">KI-Vorschlag <strong>{evaluation.score}/{evaluation.maxPoints}</strong></div><p>{evaluation.feedback}</p><ul>{evaluation.criteria.map((criterion) => <li key={criterion.name}><b>{criterion.name}</b> · {criterion.points} Pkt. — {criterion.rationale}</li>)}</ul><small>KI-Vorschlag bitte prüfen und anpassen.</small></div>}
                     <button className="button ai-button" onClick={() => void evaluate(response)} disabled={evaluating === response.id}>{evaluating === response.id ? <LoaderCircle className="spin" size={15} /> : <Activity size={15} />} KI-Bewertung anfordern</button>
                     <label className="review-field">Lehrer-Korrektur<div className="score-input"><input type="number" min="0" max={presentation.slides.find((item) => item.id === response.slideId)?.content.maxPoints || 100} value={score} onChange={(e) => setScore(e.target.value)} placeholder="Punkte" /><span>Punkte</span></div><textarea rows={3} value={feedback} onChange={(e) => setFeedback(e.target.value)} placeholder="Individuelle Rückmeldung…" /></label>
-                    <button className="button primary full" onClick={() => void saveReview()}>Korrektur speichern</button>
+                    <button className="button primary full" onClick={() => void saveReview()} disabled={reviewBusy}>Korrektur speichern</button>
+                    {response.reviewed && <button className="button secondary full" onClick={() => void releaseReview(response)} disabled={reviewBusy}>Bewertung entfernen &amp; Korrektur freigeben</button>}
                   </div>
                 );
               })()}

@@ -42,6 +42,8 @@ jobs:
         uses: actions/configure-pages@v5
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Test save queue
+        run: pnpm --filter @plexia/studio test
       - name: Build application
         run: pnpm --filter @plexia/studio build
       - name: Upload Pages artifact

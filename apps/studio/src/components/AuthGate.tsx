@@ -23,11 +23,11 @@ export function AuthGate({ onAuthenticated }: { onAuthenticated: () => void }) {
     finally { setBusy(false); }
   }
 
-  return <main className="auth-screen"><div className="auth-card"><div className="brand-mark"><span className="brand-symbol">P</span><span>PLEXIA<span className="brand-light"> STUDIO</span></span></div>
-    <div className="auth-icon"><LockKeyhole size={22}/></div><p className="eyebrow">LEHRERBEREICH</p><h1>{isSignup ? "Konto erstellen" : "Schön, dass du da bist."}</h1><p className="muted">Melde dich an, um deine Unterrichtsmaterialien sicher zu verwalten.</p>
-    <form onSubmit={submit} className="auth-form"><label>E-Mail-Adresse<input autoComplete="email" type="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@schule.de"/></label><label>Passwort<input autoComplete={isSignup?"new-password":"current-password"} type="password" minLength={8} required value={password} onChange={e=>setPassword(e.target.value)} placeholder="Mindestens 8 Zeichen"/></label>
-      {error && <p className="notice error">{error}</p>}{message && <p className="notice success">{message}</p>}<button className="button primary full" disabled={busy}>{busy?"Einen Moment…":isSignup?"Konto erstellen":"Sicher anmelden"}<ArrowRight size={17}/></button></form>
-    <button className="text-button auth-switch" onClick={()=>{setIsSignup(!isSignup);setError("");setMessage("");}}>{isSignup?"Schon ein Konto? Anmelden":"Neu bei PLEXIA? Konto erstellen"}</button>
-    <div className="auth-foot"><Sparkles size={14}/> Deine Unterrichtsideen. Klar strukturiert. Interaktiv.</div>
+  return <main className="auth-screen"><div className="auth-card"><div className="brand-mark"><span className="brand-symbol" aria-hidden="true">P</span><span>PLEXIA<span className="brand-light"> STUDIO</span></span></div>
+    <div className="auth-icon" aria-hidden="true"><LockKeyhole size={22}/></div><p className="eyebrow">LEHRKRAFTBEREICH</p><h1>{isSignup ? "Konto erstellen" : "Schön, dass du da bist."}</h1><p className="muted">{isSignup ? "Erstelle dein Konto und gestalte interaktive Unterrichtsmaterialien." : "Melde dich an, um deine Unterrichtsmaterialien sicher zu verwalten."}</p>
+    <form onSubmit={submit} className="auth-form" aria-busy={busy}><label>E-Mail-Adresse<input autoComplete="email" type="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@schule.de"/></label><label>Passwort<input autoComplete={isSignup?"new-password":"current-password"} type="password" minLength={8} required value={password} onChange={e=>setPassword(e.target.value)} placeholder="Mindestens 8 Zeichen"/></label>
+      {error && <p className="notice error" role="alert">{error}</p>}{message && <p className="notice success" role="status">{message}</p>}<button type="submit" className="button primary full" disabled={busy}>{busy?"Einen Moment…":isSignup?"Konto erstellen":"Sicher anmelden"}<ArrowRight size={17} aria-hidden="true"/></button></form>
+    <button type="button" className="text-button auth-switch" onClick={()=>{setIsSignup(!isSignup);setError("");setMessage("");}}>{isSignup?"Schon ein Konto? Anmelden":"Neu bei PLEXIA? Konto erstellen"}</button>
+    <div className="auth-foot"><Sparkles size={14} aria-hidden="true"/> Deine Unterrichtsideen. Klar strukturiert. Interaktiv.</div>
   </div></main>;
 }

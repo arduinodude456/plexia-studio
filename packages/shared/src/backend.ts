@@ -1,14 +1,18 @@
 import { createClient, type RealtimeChannel, type SupabaseClient } from "@supabase/supabase-js";
 import type { ClassSession, Presentation, SessionBundle, SessionGroupAssignment, StudentResponse } from "./model";
 
-const env = import.meta.env;
+const env = import.meta.env ?? {};
 const supabaseUrl = env.VITE_SUPABASE_URL as string | undefined;
 const supabaseAnonKey = env.VITE_SUPABASE_ANON_KEY as string | undefined;
+
+// The old Supabase default key was shared with Connect and does not identify a
+// trustworthy app/role. Do not import or delete it: existing users sign in once.
+const AUTH_STORAGE_KEY = "plexia-studio-auth-v1";
 
 export const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
 export const supabase: SupabaseClient | null = hasSupabaseConfig
   ? createClient(supabaseUrl!, supabaseAnonKey!, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+      auth: { storageKey: AUTH_STORAGE_KEY, persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
       realtime: { params: { eventsPerSecond: 8 } },
     })
   : null;
@@ -18,7 +22,9 @@ export function requireSupabase(): SupabaseClient {
   return supabase;
 }
 
-function mapSession(row: Record<string, unknown>): ClassSession {
+export type SyncedClassSession = ClassSession & { syncUpdatedAt: string };
+
+function mapSession(row: Record<string, unknown>): SyncedClassSession {
   return {
     id: String(row.id),
     presentationId: String(row.presentation_id),
@@ -27,6 +33,7 @@ function mapSession(row: Record<string, unknown>): ClassSession {
     currentSlideIndex: Number(row.current_slide_index ?? 0),
     activityStatus: (row.activity_status ?? "idle") as ClassSession["activityStatus"],
     createdAt: String(row.created_at ?? new Date().toISOString()),
+    syncUpdatedAt: String(row.updated_at ?? ""),
   };
 }
 
@@ -62,6 +69,37 @@ function withTimeout<T>(promise: PromiseLike<T>, message: string, milliseconds =
     Promise.resolve(promise).then((value) => { window.clearTimeout(timer); resolve(value); }, (error: unknown) => { window.clearTimeout(timer); reject(error); });
   });
 }
+
+// Coalesces invalidations and prevents a response started before an event/write
+// from being installed. Polls may request a trailing pass without invalidation.
+export function createSnapshotScheduler(run: (isCurrent: () => boolean) => Promise<void>) {
+  let active = true;
+  let running = false;
+  let pending = false;
+  let generation = 0;
+  const drain = async () => {
+    if (running || !active) return;
+    running = true;
+    try {
+      while (active && pending) {
+        pending = false;
+        const started = generation;
+        try { await run(() => active && started === generation); }
+        catch (error) { console.error("Snapshot-Abgleich fehlgeschlagen", error); }
+      }
+    } finally { running = false; }
+  };
+  return {
+    request(invalidate = true) {
+      if (!active) return;
+      if (invalidate) generation += 1;
+      pending = true;
+      void drain();
+    },
+    close() { active = false; generation += 1; pending = false; },
+  };
+}
+
 export async function signInTeacher(email: string, password: string) {
   const client = requireSupabase();
   const { data, error } = await client.auth.signInWithPassword({ email, password });
@@ -232,7 +270,7 @@ export async function deletePresentationStorage(presentationId: string): Promise
   }
 }
 
-export async function createClassSession(presentation: Presentation): Promise<ClassSession> {
+export async function createClassSession(presentation: Presentation): Promise<SyncedClassSession> {
   const client = requireSupabase();
   await savePresentation(presentation);
   const { data, error } = await client.from("class_sessions").insert({
@@ -240,21 +278,32 @@ export async function createClassSession(presentation: Presentation): Promise<Cl
     status: "live",
     current_slide_index: 0,
     activity_status: "running",
-  }).select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at").single();
+  }).select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at,updated_at").single();
   if (error) throw error;
   return mapSession(data as Record<string, unknown>);
 }
 
-export async function updateClassSession(sessionId: string, patch: Partial<Pick<ClassSession, "status" | "currentSlideIndex" | "activityStatus">>): Promise<ClassSession> {
-  const client = requireSupabase();
+export async function getClassSession(sessionId: string): Promise<SyncedClassSession> {
+  const { data, error } = await withTimeout(requireSupabase().from("class_sessions")
+    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at,updated_at")
+    .eq("id", sessionId).single(), "Der Sitzungsstatus konnte nicht geladen werden.");
+  if (error) throw error;
+  return mapSession(data as Record<string, unknown>);
+}
+
+export async function updateClassSession(sessionId: string, patch: Partial<Pick<ClassSession, "status" | "currentSlideIndex" | "activityStatus">>, expectedUpdatedAt: string, client: SupabaseClient = requireSupabase()): Promise<SyncedClassSession> {
+  if (!expectedUpdatedAt) throw new Error("Der Sitzungsstatus wird noch abgeglichen. Bitte versuche es erneut.");
   const values: Record<string, unknown> = {};
   if (patch.status !== undefined) values.status = patch.status;
   if (patch.currentSlideIndex !== undefined) values.current_slide_index = patch.currentSlideIndex;
   if (patch.activityStatus !== undefined) values.activity_status = patch.activityStatus;
-  values.updated_at = new Date().toISOString();
-  const { data, error } = await client.from("class_sessions").update(values).eq("id", sessionId)
-    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at").single();
+  // The DB trigger, not a client clock, supplies updated_at. CAS avoids lost updates.
+  const { data, error } = await withTimeout(client.from("class_sessions").update(values)
+    .eq("id", sessionId).eq("updated_at", expectedUpdatedAt).neq("status", "ended")
+    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at,updated_at").maybeSingle(),
+    "Der Sitzungsbefehl wurde nicht bestätigt. Der aktuelle Status wird erneut geladen.");
   if (error) throw error;
+  if (!data) throw new Error("Die Sitzung wurde zwischenzeitlich geändert oder beendet. Bitte prüfe den aktuellen Status und versuche es erneut.");
   return mapSession(data as Record<string, unknown>);
 }
 
@@ -381,23 +430,48 @@ export async function createSignedStudentPhotoUrl(path: string, expiresIn = 900)
 
 export async function listSessionResponses(sessionId: string): Promise<StudentResponse[]> {
   const client = requireSupabase();
-  const { data, error } = await client.from("student_responses").select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed")
-    .eq("session_id", sessionId).order("created_at", { ascending: true });
-  if (error) throw error;
-  return (data ?? []).map((row: Record<string, unknown>) => mapResponse(row));
+  const rows: StudentResponse[] = [];
+  const pageSize = 500;
+  for (let offset = 0; ; offset += pageSize) {
+    const { data, error } = await withTimeout(client.from("student_responses")
+      .select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed")
+      .eq("session_id", sessionId).order("created_at", { ascending: true }).order("id", { ascending: true })
+      .range(offset, offset + pageSize - 1), "Die Antworten konnten nicht geladen werden.");
+    if (error) throw error;
+    rows.push(...(data ?? []).map((row: Record<string, unknown>) => mapResponse(row)));
+    if ((data ?? []).length < pageSize) return rows;
+  }
+}
+
+export async function listSessionParticipants(sessionId: string): Promise<Array<{ userId: string; nickname: string; joinedAt: string }>> {
+  const rows: Array<{ userId: string; nickname: string; joinedAt: string }> = [];
+  const pageSize = 500;
+  for (let offset = 0; ; offset += pageSize) {
+    const { data, error } = await withTimeout(requireSupabase().from("session_participants")
+      .select("user_id,nickname,joined_at").eq("session_id", sessionId)
+      .order("joined_at", { ascending: true }).order("user_id", { ascending: true })
+      .range(offset, offset + pageSize - 1), "Die Teilnehmendenliste konnte nicht geladen werden.");
+    if (error) throw error;
+    rows.push(...(data ?? []).map((row) => ({ userId: String(row.user_id), nickname: String(row.nickname || "Teilnehmer"), joinedAt: String(row.joined_at || "") })));
+    if ((data ?? []).length < pageSize) return rows;
+  }
 }
 
 export async function listGroupAssignments(sessionId: string, slideId?: string): Promise<SessionGroupAssignment[]> {
   const client = requireSupabase();
-  let query = client.from("session_group_assignments")
-    .select("session_id,slide_id,user_id,group_number,assigned_at")
-    .eq("session_id", sessionId)
-    .order("group_number", { ascending: true })
-    .order("assigned_at", { ascending: true });
-  if (slideId) query = query.eq("slide_id", slideId);
-  const { data, error } = await query;
-  if (error) throw error;
-  return (data ?? []).map((row) => mapGroupAssignment(row as Record<string, unknown>));
+  const rows: SessionGroupAssignment[] = [];
+  const pageSize = 500;
+  for (let offset = 0; ; offset += pageSize) {
+    let query = client.from("session_group_assignments")
+      .select("session_id,slide_id,user_id,group_number,assigned_at").eq("session_id", sessionId)
+      .order("slide_id", { ascending: true }).order("user_id", { ascending: true })
+      .range(offset, offset + pageSize - 1);
+    if (slideId) query = query.eq("slide_id", slideId);
+    const { data, error } = await withTimeout(query, "Die Gruppenzuteilungen konnten nicht geladen werden.");
+    if (error) throw error;
+    rows.push(...(data ?? []).map((row) => mapGroupAssignment(row as Record<string, unknown>)));
+    if ((data ?? []).length < pageSize) return rows;
+  }
 }
 
 export async function saveGroupAssignments(sessionId: string, slideId: string, assignments: Record<string, number>): Promise<void> {
@@ -434,6 +508,7 @@ export function subscribeToSession(
   onSession: (session: ClassSession) => void,
   onResponse: (response: StudentResponse) => void,
   onStatus?: (status: string) => void,
+  onAssignments?: () => void,
 ): RealtimeChannel {
   const client = requireSupabase();
   const responseHandler = (payload: { new: Record<string, unknown> }) => {
@@ -446,6 +521,8 @@ export function subscribeToSession(
       responseHandler)
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "student_responses", filter: `session_id=eq.${sessionId}` },
       responseHandler)
+    .on("postgres_changes", { event: "*", schema: "public", table: "session_group_assignments", filter: `session_id=eq.${sessionId}` },
+      () => onAssignments?.())
     .subscribe((status) => onStatus?.(status));
 }
 

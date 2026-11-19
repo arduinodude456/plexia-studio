@@ -335,8 +335,12 @@ function normalizePresentation(value: unknown): { presentation: Presentation; re
     return { ...safeSlide, id: normalizedId, content: safeContent, elements: safeElements } as unknown as PlexiaSlide;
   });
   const theme = ["light", "dark", "ocean", "violet"].includes(String(raw.theme)) ? raw.theme as Presentation["theme"] : "light";
+  // Import creates a new copy rather than silently upserting over an existing deck.
+  // Generate the ID before uploading media so the storage paths match the copy.
+  let importedId = newUuid();
+  while (ids.has(importedId.toLowerCase())) importedId = newUuid();
   const presentation: Presentation = {
-    id: takeId(raw.id), title: presentationTitle.slice(0, 500), description: typeof raw.description === "string" ? raw.description.slice(0, 20_000) : "",
+    id: importedId, title: presentationTitle.slice(0, 160), description: typeof raw.description === "string" ? raw.description.slice(0, 20_000) : "",
     theme, slides: safeSlides, version: 1, updatedAt: new Date().toISOString(),
   };
   return { presentation, repairedIds, slideIdRemap };
