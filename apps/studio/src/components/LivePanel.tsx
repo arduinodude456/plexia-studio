@@ -8,6 +8,8 @@ import {
   ExternalLink,
   Image as ImageIcon,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   QrCode,
   Radio,
   ScanText,
@@ -114,6 +116,12 @@ function wordFrequencies(responses: StudentResponse[]): Array<{ word: string; co
   return [...counts].map(([word, count]) => ({ word, count })).sort((a, b) => b.count - a.count || a.word.localeCompare(b.word, "de")).slice(0, 40);
 }
 
+function mergeResponseLists(existing: StudentResponse[], incoming: StudentResponse[]): StudentResponse[] {
+  const merged = new Map(existing.map((response) => [response.id, response]));
+  for (const response of incoming) merged.set(response.id, response);
+  return [...merged.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
 function stableHash(value: string): number {
   let hash = 2166136261;
   for (let i = 0; i < value.length; i += 1) hash = Math.imul(hash ^ value.charCodeAt(i), 16777619);
@@ -128,8 +136,11 @@ function buildGroupAssignment(sessionId: string, slideId: string, participants: 
 
 export function LivePanel({ presentation, onClose }: Props) {
   const [session, setSession] = useState<ClassSession | null>(null);
+  const [realtimeStatus, setRealtimeStatus] = useState("CONNECTING");
   const [responses, setResponses] = useState<StudentResponse[]>([]);
   const [busy, setBusy] = useState(false);
+  const [ending, setEnding] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [selected, setSelected] = useState("");
@@ -182,9 +193,10 @@ export function LivePanel({ presentation, onClose }: Props) {
         userId: String(row.user_id), nickname: String(row.nickname || "Teilnehmer"), joinedAt: String(row.joined_at || ""),
       })));
     };
+    setRealtimeStatus("CONNECTING");
     void listSessionResponses(session.id)
       .then((items) => {
-        if (active) setResponses(items);
+        if (active) setResponses((previous) => mergeResponseLists(previous, items));
       })
       .catch((e: unknown) => {
         if (active) setError(e instanceof Error ? e.message : "Antworten konnten nicht geladen werden.");
@@ -226,6 +238,16 @@ export function LivePanel({ presentation, onClose }: Props) {
           void refreshParticipants().catch(() => undefined);
         }
       },
+      (status) => {
+        if (!active) return;
+        setRealtimeStatus(status);
+        if (status === "SUBSCRIBED") {
+          void listSessionResponses(session.id).then((items) => {
+            if (active) setResponses((previous) => mergeResponseLists(previous, items));
+          }).catch(() => undefined);
+          void refreshParticipants().catch(() => undefined);
+        }
+      },
     );
     return () => {
       active = false;
@@ -257,6 +279,43 @@ export function LivePanel({ presentation, onClose }: Props) {
       setError(e instanceof Error ? e.message : "Die Sitzung konnte nicht aktualisiert werden.");
     }
   }
+
+  async function endSession() {
+    if (!session || session.status === "ended" || ending) return;
+    if (!window.confirm("Sitzung jetzt wirklich beenden? Teilnehmende können danach keine Antworten mehr senden.")) return;
+    setEnding(true);
+    setError("");
+    try {
+      await updateClassSession(session.id, { status: "ended", activityStatus: "ended" });
+      setSession({ ...session, status: "ended", activityStatus: "ended" });
+      setNotice("Die Live-Sitzung wurde beendet.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Die Sitzung konnte nicht beendet werden.");
+    } finally {
+      setEnding(false);
+    }
+  }
+
+  function closeLive() {
+    if (session && session.status !== "ended" && !window.confirm("Deine Klasse bleibt in der laufenden Sitzung, wenn du zum Editor zurückkehrst. Wirklich verlassen?")) return;
+    onClose();
+  }
+
+  async function toggleFullscreen() {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
+      else throw new Error("Der Vollbildmodus wird von diesem Browser nicht unterstützt.");
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : "Vollbild konnte nicht aktiviert werden.");
+    }
+  }
+
+  useEffect(() => {
+    const syncFullscreen = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+  }, []);
 
   async function evaluate(response: StudentResponse) {
     setEvaluating(response.id);
@@ -320,6 +379,24 @@ export function LivePanel({ presentation, onClose }: Props) {
   const frequencyWords = wordFrequencies(currentSlideResponses);
   const assignment = current ? groupAssignments[current.id] : undefined;
   const assignedGroups = assignment ? [...new Set(Object.values(assignment))].sort((a, b) => a - b) : [];
+
+  useEffect(() => {
+    if (!session || session.status === "ended") return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.key === "ArrowLeft" && currentIndex > 0) {
+        event.preventDefault();
+        void patch({ currentSlideIndex: currentIndex - 1 });
+      } else if (event.key === "ArrowRight" && currentIndex < presentation.slides.length - 1) {
+        event.preventDefault();
+        void patch({ currentSlideIndex: currentIndex + 1 });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [session?.id, session?.status, currentIndex, presentation.slides.length]);
 
   async function assignGroups() {
     if (!session || !current || !supabase) return;
@@ -464,14 +541,16 @@ export function LivePanel({ presentation, onClose }: Props) {
   return (
     <div className="live-overlay">
       <header className="live-top">
-        <button className="live-brand" onClick={onClose}>
+        <button className="live-brand" onClick={closeLive}>
           <span className="brand-symbol small">P</span> PLEXIA <span className="brand-light">LIVE</span>
         </button>
         <div className="live-status">
           <i className={session?.status === "live" ? "dot green" : "dot"} />
           {session ? session.status === "live" ? "Sitzung live" : session.status === "paused" ? "Sitzung pausiert" : "Sitzung beendet" : "Nicht gestartet"}
         </div>
-        <button className="icon-button live-close" onClick={onClose} aria-label="Live-Ansicht schließen"><X size={20} /></button>
+        {session && <div className={`live-realtime ${realtimeStatus === "SUBSCRIBED" ? "connected" : realtimeStatus === "CHANNEL_ERROR" || realtimeStatus === "TIMED_OUT" ? "disconnected" : ""}`}><i />{realtimeStatus === "SUBSCRIBED" ? "Echtzeit verbunden" : realtimeStatus === "CHANNEL_ERROR" || realtimeStatus === "TIMED_OUT" ? "Verbindung unterbrochen" : "Verbinde…"}</div>}
+        {session && <button className="icon-button live-fullscreen" onClick={() => void toggleFullscreen()} aria-label={isFullscreen ? "Vollbild verlassen" : "Vollbild"} title={isFullscreen ? "Vollbild verlassen" : "Vollbild"}>{isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}</button>}
+        <button className="icon-button live-close" onClick={closeLive} aria-label="Live-Ansicht schließen"><X size={20} /></button>
       </header>
 
       {!hasSupabaseConfig ? (
@@ -493,23 +572,23 @@ export function LivePanel({ presentation, onClose }: Props) {
             <button className="button primary large" onClick={() => void start()} disabled={busy}>{busy ? <LoaderCircle className="spin" size={19} /> : <Radio size={19} />} Live-Sitzung starten</button>
             <small><Users size={14} /> Deine Klasse tritt über QR-Code oder Beitrittscode bei.</small>
           </div>
-          <button className="text-button" onClick={onClose}>Abbrechen</button>
+          <button className="text-button" onClick={closeLive}>Abbrechen</button>
         </main>
       ) : (
         <main className="live-content">
           <section className="live-stage-column">
             <div className="live-toolbar">
-              <div><span className="live-chip"><i className="dot green" /> LIVE</span><strong>{presentation.title}</strong></div>
+              <div className="live-heading"><span className={`live-chip ${session.status}`}><i className="dot" /> {session.status === "live" ? "LIVE" : session.status === "paused" ? "PAUSIERT" : "BEENDET"}</span><strong>{presentation.title}</strong><span className="live-audience"><Users size={15} /> {participants.length} dabei</span></div>
               <div className="live-session-controls">
                 {session.status !== "ended" && <button className="button secondary small-button" onClick={() => void patch({ status: session.status === "paused" ? "live" : "paused" })}>{session.status === "paused" ? <CirclePlay size={16} /> : <CirclePause size={16} />} {session.status === "paused" ? "Fortsetzen" : "Pausieren"}</button>}
-                {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void patch({ status: "ended", activityStatus: "ended" })}><Square size={14} /> Sitzung beenden</button>}
+                {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
               </div>
             </div>
             <div className="live-slide-frame">{current && <SlideStage slide={current} preview />}</div>
             <div className="live-slide-nav">
-              <button className="button secondary" disabled={currentIndex <= 0} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
+              <button className="button secondary" disabled={currentIndex <= 0 || session.status === "ended"} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
               <span>Folie <b>{currentIndex + 1}</b> / {presentation.slides.length}</span>
-              <button className="button primary" disabled={currentIndex >= presentation.slides.length - 1} onClick={() => void patch({ currentSlideIndex: currentIndex + 1 })}>Weiter →</button>
+              <button className="button primary" disabled={currentIndex >= presentation.slides.length - 1 || session.status === "ended"} onClick={() => void patch({ currentSlideIndex: currentIndex + 1 })}>Weiter →</button>
             </div>
             <div className="activity-control">
               <div className="activity-title"><Activity size={18} /><div><strong>Interaktion</strong><small>{session.activityStatus === "running" ? "Aktivität läuft" : "Aktivität pausiert oder wartet"}</small></div></div>

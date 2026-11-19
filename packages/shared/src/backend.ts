@@ -431,6 +431,7 @@ export function subscribeToSession(
   sessionId: string,
   onSession: (session: ClassSession) => void,
   onResponse: (response: StudentResponse) => void,
+  onStatus?: (status: string) => void,
 ): RealtimeChannel {
   const client = requireSupabase();
   const responseHandler = (payload: { new: Record<string, unknown> }) => {
@@ -443,7 +444,7 @@ export function subscribeToSession(
       responseHandler)
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "student_responses", filter: `session_id=eq.${sessionId}` },
       responseHandler)
-    .subscribe();
+    .subscribe((status) => onStatus?.(status));
 }
 
 export function subscribeToPresentation(presentationId: string, onPresentation: (presentation: Presentation) => void): RealtimeChannel {
