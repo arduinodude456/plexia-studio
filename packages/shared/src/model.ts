@@ -49,6 +49,12 @@ export interface SlideElement {
   rows?: string[][];
   points?: Array<{ label: string; value: number }>;
   alt?: string;
+  /** Font size in pixels relative to a 1000px-wide slide. */
+  fontSize?: number;
+  fontWeight?: "normal" | "bold";
+  fontStyle?: "normal" | "italic";
+  textAlign?: "left" | "center" | "right";
+  objectFit?: "cover" | "contain";
 }
 
 export interface SlideContent {
