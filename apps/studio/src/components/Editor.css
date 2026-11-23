@@ -191,3 +191,33 @@
   .editor-shell .slide-rail { min-height: 0; }
   .editor-shell .slide-list { max-height: none; }
 }
+
+
+/* Direkte Größenänderung auf der Bühne. */
+.editor-shell .slide-element { overflow: visible; }
+.editor-shell .slide-element.element-image,
+.editor-shell .slide-element.element-video { overflow: hidden; }
+.editor-shell .resize-handles { position: absolute; inset: 0; z-index: 20; pointer-events: none; }
+.editor-shell .resize-handle { position: absolute; width: 11px; height: 11px; padding: 0; border: 2px solid #fff; border-radius: 50%; background: #5b36c9; box-shadow: 0 1px 4px #24164266; pointer-events: auto; transform: translate(-50%,-50%); }
+.editor-shell .resize-handle:hover { width: 14px; height: 14px; background: #25a999; }
+.editor-shell .resize-nw { left: 0; top: 0; cursor: nwse-resize; }
+.editor-shell .resize-n { left: 50%; top: 0; cursor: ns-resize; }
+.editor-shell .resize-ne { left: 100%; top: 0; cursor: nesw-resize; }
+.editor-shell .resize-e { left: 100%; top: 50%; cursor: ew-resize; }
+.editor-shell .resize-se { left: 100%; top: 100%; cursor: nwse-resize; }
+.editor-shell .resize-s { left: 50%; top: 100%; cursor: ns-resize; }
+.editor-shell .resize-sw { left: 0; top: 100%; cursor: nesw-resize; }
+.editor-shell .resize-w { left: 0; top: 50%; cursor: ew-resize; }
+.editor-shell .element-image img { width: 100%; height: 100%; display: block; }
+.editor-shell .editor-deck-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; margin-bottom: 25px; }
+.editor-shell .editor-deck-card { min-height: 128px; display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-end; gap: 5px; padding: 14px; overflow: hidden; position: relative; border: 1px solid transparent; border-radius: 14px; color: #fff; text-align: left; cursor: pointer; }
+.editor-shell .editor-deck-card::before { content: ""; position: absolute; width: 115px; height: 115px; right: -28px; top: -35px; border: 18px solid #ffffff2b; border-radius: 50%; }
+.editor-shell .editor-deck-card strong, .editor-shell .editor-deck-card span, .editor-shell .editor-deck-card b { position: relative; z-index: 1; }
+.editor-shell .editor-deck-card strong { font: 800 20px Manrope,sans-serif; }
+.editor-shell .editor-deck-card span { font-size: 9px; opacity: .85; }
+.editor-shell .editor-deck-card b { margin-top: 8px; font-size: 9px; }
+.editor-shell .editor-deck-card:hover { transform: translateY(-2px); box-shadow: 0 7px 0 #24164222; }
+.editor-shell .deck-aurora { background: linear-gradient(135deg,#302a72,#159f9a); }
+.editor-shell .deck-tech { background: linear-gradient(135deg,#101418,#334e63); color: #d8ff62; }
+.editor-shell .deck-book { background: linear-gradient(135deg,#7d493c,#d09c62); }
+@media(max-width:600px) { .editor-shell .editor-deck-grid { grid-template-columns: 1fr; } .editor-shell .editor-deck-card { min-height: 100px; } }

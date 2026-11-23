@@ -43,11 +43,18 @@ function VideoContent({ source, alt }: { source: string; alt?: string }) {
     : <iframe src={videoEmbedUrl(url)} title={alt || "Eingebettetes Video"} allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen/>;
 }
 
-function StageElement({ element, selected, onSelect, onPointerDown }: {
+export type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+const resizeHandles: ResizeHandle[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
+function fontFamilyCss(value: SlideElement["fontFamily"]): string | undefined {
+  return value === "serif" ? "Georgia, serif" : value === "mono" ? "ui-monospace, monospace" : value === "display" ? "Manrope, ui-sans-serif, sans-serif" : value === "rounded" ? "ui-rounded, 'Arial Rounded MT Bold', sans-serif" : value === "sans" ? "Inter, ui-sans-serif, sans-serif" : undefined;
+}
+
+function StageElement({ element, selected, onSelect, onPointerDown, onResizeStart }: {
   element: SlideElement;
   selected: boolean;
   onSelect?: (id: string) => void;
   onPointerDown?: (event: PointerEvent<HTMLDivElement>, element: SlideElement) => void;
+  onResizeStart?: (event: PointerEvent<HTMLButtonElement>, element: SlideElement, handle: ResizeHandle) => void;
 }) {
   const mediaUrl = usePresentationMediaUrl(element.kind === "image" ? element.content : "");
   const editable = Boolean(onPointerDown);
@@ -57,11 +64,13 @@ function StageElement({ element, selected, onSelect, onPointerDown }: {
       left: `${element.x}%`, top: `${element.y}%`, width: `${element.width}%`, height: `${element.height}%`, zIndex: element.zIndex,
       background: element.kind === "shape" && element.shape !== "line" ? (element.background || "#dfe7ff") : undefined,
       color: element.color || "#17233d", transform: `rotate(${element.rotation}deg)`,
-      borderRadius: element.kind === "shape" && element.shape === "circle" ? "50%" : undefined,
+      borderRadius: element.borderRadius !== undefined ? `${element.borderRadius}%` : element.kind === "shape" && element.shape === "circle" ? "50%" : undefined,
       fontSize: element.kind === "text" && element.fontSize ? `${element.fontSize / 10}cqw` : undefined,
       fontWeight: element.kind === "text" ? element.fontWeight : undefined,
       fontStyle: element.kind === "text" ? element.fontStyle : undefined,
       textAlign: element.kind === "text" ? element.textAlign : undefined,
+      fontFamily: element.kind === "text" ? fontFamilyCss(element.fontFamily) : undefined,
+      opacity: element.opacity ?? 1,
     }}
     tabIndex={editable ? 0 : undefined}
     role={editable ? "button" : undefined}
@@ -72,7 +81,7 @@ function StageElement({ element, selected, onSelect, onPointerDown }: {
   >
     {element.kind === "text" && <span>{element.content || "Text hier eingeben"}</span>}
     {element.kind === "image" && (mediaUrl
-      ? <img src={mediaUrl} alt={element.alt || ""} draggable={false} style={{objectFit: element.objectFit || "cover"}}/>
+      ? <img src={mediaUrl} alt={element.alt || ""} draggable={false} style={{objectFit: element.objectFit || "cover", objectPosition: element.objectPosition || "50% 50%"}}/>
       : <div className="element-placeholder">{element.content ? "Bild wird geladen…" : "Bild-URL hinzufügen"}</div>)}
     {element.kind === "video" && <VideoContent source={element.content} alt={element.alt}/>}
     {element.kind === "shape" && element.shape === "line" && <div className="shape-line" style={{background: element.background || "#766ade"}}/>}
@@ -80,6 +89,7 @@ function StageElement({ element, selected, onSelect, onPointerDown }: {
       <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table>}
     {element.kind === "chart" && <div className="chart-bars">{(element.points || [{label:"A",value:6},{label:"B",value:9},{label:"C",value:4}]).map((point, index) =>
       <div className="chart-column" key={`${point.label}-${index}`}><i style={{height:`${Math.max(10,Math.min(100,point.value*8))}%`}}/><small>{point.label}</small></div>)}</div>}
+    {selected && editable && <div className="resize-handles" aria-label="Element skalieren">{resizeHandles.map(handle => <button key={handle} type="button" className={`resize-handle resize-${handle}`} aria-label={`An Griff ${handle} skalieren`} onPointerDown={event => onResizeStart?.(event, element, handle)} />)}</div>}
   </div>;
 }
 
@@ -105,18 +115,19 @@ function SlideContentPreview({ slide }: { slide: PlexiaSlide }) {
   </div>;
 }
 
-export function SlideStage({slide, preview=false, selectedId, onSelect, onPointerDown}: {
+export function SlideStage({slide, preview=false, selectedId, onSelect, onPointerDown, onResizeStart}: {
   slide: PlexiaSlide;
   preview?: boolean;
   selectedId?: string;
   onSelect?: (id: string) => void;
   onPointerDown?: (event: PointerEvent<HTMLDivElement>, element: SlideElement) => void;
+  onResizeStart?: (event: PointerEvent<HTMLButtonElement>, element: SlideElement, handle: ResizeHandle) => void;
 }) {
   // Activity and video content remain visible when decorative elements are added.
   // Existing standard slides with custom text retain their original appearance.
   const showContent = slide.elements.length === 0 || slide.type !== "standard";
   return <div className={`slide-stage ${preview ? "stage-preview" : ""}`} style={{background:slide.background||"#fff"}}>
     {showContent && <div className="stage-empty"><span className="stage-empty-mark">✦</span><strong>{slide.title||"Deine Folie"}</strong><SlideContentPreview slide={slide}/>{!preview && !slide.content.body && ["standard", "video"].includes(slide.type) && <small>Elemente hinzufügen, um deine Idee zum Leben zu erwecken.</small>}</div>}
-    {slide.elements.map(element=><StageElement key={element.id} element={element} selected={selectedId===element.id} onSelect={onSelect} onPointerDown={onPointerDown}/>)}
+    {slide.elements.map(element=><StageElement key={element.id} element={element} selected={selectedId===element.id} onSelect={onSelect} onPointerDown={onPointerDown} onResizeStart={onResizeStart}/>)}
   </div>;
 }

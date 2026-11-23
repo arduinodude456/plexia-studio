@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState, type DragEvent, type FormEvent, type PointerEvent } from "react";
 import { AlignCenter, AlignLeft, AlignRight, ArrowDown, ArrowLeft, ArrowUp, BarChart3, Bold, Circle, Copy, Eye, Image, Italic, Layers, LineChart, LoaderCircle, MessageCircle, MonitorPlay, MousePointer2, Plus, Redo2, Send, Settings2, Shapes, Sparkles, Table2, Trash2, Type, Undo2, Upload, Video, X } from "lucide-react";
 import { createId, createSlide, groqProxy, hasSupabaseConfig, slideTypeLabels, uploadPresentationMedia, type Presentation, type PlexiaSlide, type SlideElement, type SlideType } from "@plexia/shared";
-import { SlideStage } from "./SlideStage";
+import { SlideStage, type ResizeHandle } from "./SlideStage";
 import { exportPresentation } from "../lib/presentations";
 import { editPresentationLocally, LOCAL_MODELS, loadLocalModel, localModelIsSupported, type LocalModelId } from "../lib/local-ai";
 import "./Editor.css";
 
 interface Props { presentation: Presentation; onChange: (p: Presentation) => void; onBack: () => void; onLive: () => void; isCloud: boolean; saving: boolean; saveError?: boolean }
 type ElementPatch = Partial<SlideElement>;
-type Template = "cover" | "content" | "split" | "quote";
+type Template = "cover" | "content" | "split" | "quote" | "aurora" | "tech" | "book";
 const colors = ["#ffffff", "#f1ebff", "#e1f7f0", "#fff2cf", "#ffe4e9", "#dff2ff", "#e5eaff", "#ffead7"];
 const inkColors = ["#17233d", "#5b36c9", "#e34d69", "#087e77", "#d67016", "#ffffff"];
 const typeGroups: Array<{ label: string; items: Array<{ type: SlideType; description: string }> }> = [
@@ -19,6 +19,7 @@ const typeGroups: Array<{ label: string; items: Array<{ type: SlideType; descrip
 const templates: Array<{ id: Template; title: string; detail: string }> = [
   {id:"cover",title:"Titelfolie",detail:"Ein starker Anfang"}, {id:"content",title:"Titel & Text",detail:"Für deine wichtigsten Ideen"},
   {id:"split",title:"Text & Bild",detail:"Inhalt mit Bildfläche"}, {id:"quote",title:"Zitat",detail:"Ein Gedanke im Mittelpunkt"},
+  {id:"aurora",title:"Aurora",detail:"Leuchtend · weich · modern"}, {id:"tech",title:"Tech",detail:"Kontrastreich · präzise · digital"}, {id:"book",title:"Book",detail:"Editorial · ruhig · elegant"},
 ];
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(n) ? n : min));
 function newElement(kind: SlideElement["kind"], z: number): SlideElement {
@@ -45,9 +46,18 @@ function templateSlide(template: Template): PlexiaSlide {
   } else if (template === "split") {
     slide.title = "Text & Bild"; slide.background = "#e1f7f0";
     slide.elements = [text("Deine Idee",8,19,42,19,45), text("Erkläre hier, was wichtig ist.",8,43,40,30,27,{fontWeight:"normal"}), {...newElement("image",2),x:55,y:15,width:36,height:70}];
-  } else {
+  } else if (template === "quote") {
     slide.title = "Ein Gedanke"; slide.background = "#fff2cf";
     slide.elements = [text("„Ein Gedanke kann alles verändern.“",12,30,76,34,46,{textAlign:"center"}),text("— Deine Quelle",25,70,50,12,22,{fontWeight:"normal",textAlign:"center",color:"#6d5a3d"})];
+  } else if (template === "aurora") {
+    slide.title = "Aurora"; slide.background = "#10152e";
+    slide.elements = [text("Ideen, die leuchten",9,23,72,23,54,{fontFamily:"display",color:"#f7f4ff"}),text("Ein weicher Start für große Gedanken.",10,55,62,14,25,{fontWeight:"normal",fontFamily:"sans",color:"#b8c5ff"}),{...newElement("shape",1),x:76,y:10,width:17,height:28,shape:"circle",background:"#71e2d2",opacity:.72,borderRadius:50}];
+  } else if (template === "tech") {
+    slide.title = "System 01"; slide.background = "#101418";
+    slide.elements = [text("SYSTEM 01",9,13,72,16,48,{fontFamily:"mono",color:"#d8ff62"}),text("Build a better tomorrow.",10,38,78,22,40,{fontFamily:"display",color:"#ffffff"}),text("// PLEXIA · 2026",10,76,55,10,17,{fontFamily:"mono",fontWeight:"normal",color:"#8a99a8"})];
+  } else {
+    slide.title = "Kapitel Eins"; slide.background = "#f5efe3";
+    slide.elements = [text("Kapitel Eins",10,17,78,20,48,{fontFamily:"serif",color:"#2e2b27"}),text("Eine ruhige Bühne für Geschichten, Wissen und Details.",11,48,65,25,25,{fontFamily:"serif",fontWeight:"normal",color:"#6f675a"})];
   }
   return slide;
 }
@@ -94,6 +104,7 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
   latestDoc.current=doc;
   const latestCommit=useRef<(next: Presentation) => void>(()=>{});
   const drag=useRef<{id:string;slideId:string;startX:number;startY:number;x:number;y:number;width:number;height:number;rect:DOMRect;latest:Presentation;moved:boolean}|null>(null);
+  const resize=useRef<{id:string;slideId:string;handle:ResizeHandle;startX:number;startY:number;x:number;y:number;width:number;height:number;rect:DOMRect;latest:Presentation;moved:boolean}|null>(null);
   const slide=doc.slides.find(s=>s.id===slideId)||doc.slides[0];
   const selected=slide?.elements.find(e=>e.id===selectedId);
   const slideIndex=doc.slides.findIndex(s=>s.id===slide?.id);
@@ -120,6 +131,12 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
     if(!template && type==="standard") next.title="Neue Folie";
     const slides=[...doc.slides]; slides.splice(Math.max(0,slideIndex+1),0,next);
     commit({...doc,slides}); chooseSlide(next.id); setChooser(false);
+  }
+  function addTemplateDeck(template: Extract<Template,"aurora"|"tech"|"book">) {
+    const deck=[templateSlide(template),templateSlide(template),templateSlide(template)];
+    const labels=template==="aurora"?["01 · Auftakt","02 · Idee","03 · Nächster Schritt"]:template==="tech"?["SYSTEM 01","SYSTEM 02","SYSTEM 03"]:["Kapitel Eins","Kapitel Zwei","Kapitel Drei"];
+    deck.forEach((item,index)=>{item.title=labels[index]; if(index===1)item.elements=item.elements.map(element=>element.kind==="text"?{...element,content:template==="tech"?"Signal / Struktur":"Die wichtigste Idee",y:26}:element); if(index===2)item.elements=item.elements.map(element=>element.kind==="text"?{...element,content:template==="aurora"?"Bereit zum Abheben":"Dein Fazit",y:31}:element);});
+    const slides=[...doc.slides]; slides.splice(Math.max(0,slideIndex+1),0,...deck); commit({...doc,slides}); chooseSlide(deck[0].id); setChooser(false); setNotice(`${template[0].toUpperCase()+template.slice(1)}-Deck mit 3 Folien hinzugefügt.`);
   }
   function moveSlide(delta: number) {
     const j=slideIndex+delta; if(slideIndex<0||j<0||j>=doc.slides.length)return;
@@ -231,14 +248,34 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
     drag.current={id:el.id,slideId:slide.id,startX:event.clientX,startY:event.clientY,x:el.x,y:el.y,width:el.width,height:el.height,rect,latest:doc,moved:false};
     event.currentTarget.setPointerCapture(event.pointerId);
   }
+  function resizeStart(event: PointerEvent<HTMLButtonElement>,el: SlideElement,handle: ResizeHandle) {
+    if(preview||!slide)return; event.preventDefault(); event.stopPropagation(); selectElement(el.id);
+    const rect=stageRef.current?.getBoundingClientRect(); if(!rect)return;
+    resize.current={id:el.id,slideId:slide.id,handle,startX:event.clientX,startY:event.clientY,x:el.x,y:el.y,width:el.width,height:el.height,rect,latest:doc,moved:false};
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
   function pointerMove(event: PointerEvent) {
+    const r=resize.current;
+    if(r){
+      const dx=(event.clientX-r.startX)/r.rect.width*100, dy=(event.clientY-r.startY)/r.rect.height*100;
+      let left=r.x, top=r.y, right=r.x+r.width, bottom=r.y+r.height;
+      if(r.handle.includes("w")) left=clamp(r.x+dx,0,right-4);
+      if(r.handle.includes("e")) right=clamp(r.x+r.width+dx,left+4,100);
+      if(r.handle.includes("n")) top=clamp(r.y+dy,0,bottom-4);
+      if(r.handle.includes("s")) bottom=clamp(r.y+r.height+dy,top+4,100);
+      if(!r.moved&&Math.abs(dx)+Math.abs(dy)<.2)return;
+      const next={x:Math.round(left*10)/10,y:Math.round(top*10)/10,width:Math.round((right-left)*10)/10,height:Math.round((bottom-top)*10)/10};
+      const current=latestDoc.current; r.moved=true;
+      r.latest={...current,slides:current.slides.map(item=>item.id===r.slideId?{...item,elements:item.elements.map(element=>element.id===r.id?{...element,...next}:element)}:item)};
+      setDoc(r.latest); return;
+    }
     const d=drag.current; if(!d)return;
     const x=clamp(d.x+(event.clientX-d.startX)/d.rect.width*100,0,100-d.width), y=clamp(d.y+(event.clientY-d.startY)/d.rect.height*100,0,100-d.height);
     if(Math.abs(x-d.x)<0.1&&Math.abs(y-d.y)<0.1&&!d.moved)return;
     const current=latestDoc.current;
     d.moved=true; d.latest={...current,slides:current.slides.map(item=>item.id===d.slideId?{...item,elements:item.elements.map(el=>el.id===d.id?{...el,x:Math.round(x*10)/10,y:Math.round(y*10)/10}:el)}:item)}; setDoc(d.latest);
   }
-  function pointerEnd(){const finished=drag.current;drag.current=null;if(finished?.moved)commit(finished.latest);}
+  function pointerEnd(){const finished=drag.current;drag.current=null;const resized=resize.current;resize.current=null;if(finished?.moved)commit(finished.latest);if(resized?.moved)commit(resized.latest);}
   async function uploadMedia(file?: File) {
     if(!file||!selected||!slide)return; setUploadingMedia(true);setNotice("");
     const targetSlideId=slide.id, targetElementId=selected.id;
@@ -270,7 +307,7 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
       </aside>
       <main className="canvas-workspace">
         <div className="workspace-top"><div className="breadcrumb"><span>{doc.title||"Unbenannte Präsentation"}</span><b>/</b><strong>{slide?.title||"Folie"}</strong></div><div className="slide-toolbar"><label className="type-select-label"><span>Typ</span><select aria-label="Folientyp" value={slide?.type||"standard"} onChange={e=>changeType(e.target.value as SlideType)}>{typeGroups.map(group=><optgroup key={group.label} label={group.label}>{group.items.map(item=><option key={item.type} value={item.type}>{slideTypeLabels[item.type]}</option>)}</optgroup>)}</select></label><span className="toolbar-separator"/><button className="icon-button" title="Folie nach oben (Alt+↑)" aria-label="Folie nach oben" disabled={slideIndex<=0} onClick={()=>moveSlide(-1)}><ArrowUp size={16}/></button><button className="icon-button" title="Folie nach unten (Alt+↓)" aria-label="Folie nach unten" disabled={slideIndex>=doc.slides.length-1} onClick={()=>moveSlide(1)}><ArrowDown size={16}/></button><button className="icon-button" title="Folie duplizieren" aria-label="Folie duplizieren" onClick={duplicateSlide}><Copy size={16}/></button><button className="icon-button danger-icon" title="Folie löschen" aria-label="Folie löschen" onClick={deleteSlide}><Trash2 size={16}/></button><button className="icon-button editor-inspector-toggle" title="Eigenschaften öffnen oder schließen" aria-label="Eigenschaften öffnen oder schließen" aria-expanded={inspectorOpen} onClick={()=>setInspectorOpen(!inspectorOpen)}><Settings2 size={17}/></button></div></div>
-        <div className="stage-scroll"><div className="stage-shell" ref={stageRef} onPointerMove={pointerMove} onPointerUp={pointerEnd} onPointerCancel={pointerEnd} onClick={()=>setSelectedId("")}>{slide&&<SlideStage slide={slide} selectedId={selectedId} onSelect={selectElement} onPointerDown={pointerStart}/>}</div></div>
+        <div className="stage-scroll"><div className="stage-shell" ref={stageRef} onPointerMove={pointerMove} onPointerUp={pointerEnd} onPointerCancel={pointerEnd} onClick={()=>setSelectedId("")}>{slide&&<SlideStage slide={slide} selectedId={selectedId} onSelect={selectElement} onPointerDown={pointerStart} onResizeStart={resizeStart}/>}</div></div>
         <div className="stage-caption"><span><MousePointer2 size={14}/> Elemente ziehen · mit Pfeiltasten verschieben</span><span>{String(slideIndex+1).padStart(2,"0")} / {String(doc.slides.length).padStart(2,"0")}</span></div>
         <div className="element-dock"><span>HINZUFÜGEN</span><button onClick={()=>add("text")} title="Text hinzufügen"><Type size={17}/> <span>Text</span></button><button onClick={()=>add("image")} title="Bild hinzufügen"><Image size={17}/> <span>Bild</span></button><button onClick={()=>add("video")} title="Video hinzufügen"><Video size={17}/> <span>Video</span></button><button onClick={()=>add("shape")} title="Form hinzufügen"><Shapes size={17}/> <span>Form</span></button><button onClick={()=>add("table")} title="Tabelle hinzufügen"><Table2 size={17}/> <span>Tabelle</span></button><button onClick={()=>add("chart")} title="Diagramm hinzufügen"><BarChart3 size={17}/> <span>Diagramm</span></button></div>
       </main>
@@ -280,8 +317,8 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
           <div className="property-tag">{({text:"TEXT",image:"BILD",video:"VIDEO",shape:"FORM",table:"TABELLE",chart:"DIAGRAMM"} as const)[selected.kind]}</div>
           {selected.kind==="text"?<label className="prop-label">Textinhalt<textarea rows={4} value={selected.content} onChange={e=>patchElement(selected.id,{content:e.target.value})}/></label>:selected.kind==="image"||selected.kind==="video"?<label className="prop-label">{selected.kind==="image"?"Bild-URL":"Video-URL"}<input value={selected.content} onChange={e=>patchElement(selected.id,{content:e.target.value})} placeholder="https://…"/></label>:null}
           {(selected.kind==="image"||selected.kind==="video")&&<div className="media-upload-box"><input ref={mediaInputRef} type="file" accept={selected.kind==="image"?"image/png,image/jpeg,image/webp,image/gif":"video/mp4,video/webm"} hidden onChange={e=>{void uploadMedia(e.target.files?.[0]);e.target.value="";}}/><button className="button secondary full" onClick={()=>mediaInputRef.current?.click()} disabled={uploadingMedia}><Upload size={15}/>{uploadingMedia?"Wird hochgeladen…":hasSupabaseConfig?"Datei sicher hochladen":"Datei lokal auswählen"}</button><small>{hasSupabaseConfig?"Die Datei liegt im geschützten Präsentationsspeicher.":"Lokale Datei nur in dieser Browser-Sitzung verfügbar."}</small></div>}
-          {selected.kind==="image"&&<><label className="prop-label">Bildbeschreibung<input value={selected.alt||""} onChange={e=>patchElement(selected.id,{alt:e.target.value})} placeholder="Was ist auf dem Bild zu sehen?"/></label><label className="prop-label">Bilddarstellung<select value={selected.objectFit||"cover"} onChange={e=>patchElement(selected.id,{objectFit:e.target.value as SlideElement["objectFit"]})}><option value="cover">Rahmen füllen</option><option value="contain">Ganzes Bild zeigen</option></select></label></>}
-          {selected.kind==="text"&&<><div className="property-grid"><NumberField key={`${selected.id}-font`} label="Schriftgröße" min={10} max={120} value={selected.fontSize||32} onValue={fontSize=>patchElement(selected.id,{fontSize})}/><div className="prop-label">Schriftstil<div className="editor-segmented"><button title="Fett" aria-label="Fett" aria-pressed={(selected.fontWeight||"bold")==="bold"} onClick={()=>patchElement(selected.id,{fontWeight:(selected.fontWeight||"bold")==="bold"?"normal":"bold"})}><Bold size={16}/></button><button title="Kursiv" aria-label="Kursiv" aria-pressed={selected.fontStyle==="italic"} onClick={()=>patchElement(selected.id,{fontStyle:selected.fontStyle==="italic"?"normal":"italic"})}><Italic size={16}/></button></div></div></div><div className="prop-label">Ausrichtung<div className="editor-segmented"><button title="Linksbündig" aria-label="Linksbündig" aria-pressed={(selected.textAlign||"left")==="left"} onClick={()=>patchElement(selected.id,{textAlign:"left"})}><AlignLeft size={16}/></button><button title="Zentriert" aria-label="Zentriert" aria-pressed={selected.textAlign==="center"} onClick={()=>patchElement(selected.id,{textAlign:"center"})}><AlignCenter size={16}/></button><button title="Rechtsbündig" aria-label="Rechtsbündig" aria-pressed={selected.textAlign==="right"} onClick={()=>patchElement(selected.id,{textAlign:"right"})}><AlignRight size={16}/></button></div></div><div className="prop-label">Textfarbe<Palette value={selected.color||"#17233d"} options={inkColors} onChange={color=>patchElement(selected.id,{color})} label="Textfarbe"/><input type="color" aria-label="Eigene Textfarbe" value={/^#[\da-f]{6}$/i.test(selected.color||"")?selected.color:"#17233d"} onChange={e=>patchElement(selected.id,{color:e.target.value})}/></div></>}
+          {selected.kind==="image"&&<><label className="prop-label">Bildbeschreibung<input value={selected.alt||""} onChange={e=>patchElement(selected.id,{alt:e.target.value})} placeholder="Was ist auf dem Bild zu sehen?"/></label><div className="property-grid"><label className="prop-label">Darstellung<select value={selected.objectFit||"cover"} onChange={e=>patchElement(selected.id,{objectFit:e.target.value as SlideElement["objectFit"]})}><option value="cover">Rahmen füllen</option><option value="contain">Ganzes Bild zeigen</option></select></label><label className="prop-label">Fokus<select value={selected.objectPosition||"50% 50%"} onChange={e=>patchElement(selected.id,{objectPosition:e.target.value})}><option value="50% 50%">Mitte</option><option value="50% 0%">Oben</option><option value="50% 100%">Unten</option><option value="0% 50%">Links</option><option value="100% 50%">Rechts</option></select></label></div><div className="property-grid"><NumberField key={`${selected.id}-opacity`} label="Deckkraft %" min={10} max={100} value={Math.round((selected.opacity??1)*100)} onValue={opacity=>patchElement(selected.id,{opacity:opacity/100})}/><NumberField key={`${selected.id}-radius`} label="Eckenradius %" min={0} max={50} value={selected.borderRadius||0} onValue={borderRadius=>patchElement(selected.id,{borderRadius})}/></div></>}
+          {selected.kind==="text"&&<><div className="property-grid"><NumberField key={`${selected.id}-font`} label="Schriftgröße" min={10} max={120} value={selected.fontSize||32} onValue={fontSize=>patchElement(selected.id,{fontSize})}/><label className="prop-label">Schriftart<select value={selected.fontFamily||"sans"} onChange={e=>patchElement(selected.id,{fontFamily:e.target.value as SlideElement["fontFamily"]})}><option value="sans">Inter · Klar</option><option value="display">Manrope · Modern</option><option value="rounded">Rounded · Freundlich</option><option value="serif">Georgia · Editorial</option><option value="mono">Mono · Tech</option></select></label></div><div className="prop-label">Schriftstil<div className="editor-segmented"><button title="Fett" aria-label="Fett" aria-pressed={(selected.fontWeight||"bold")==="bold"} onClick={()=>patchElement(selected.id,{fontWeight:(selected.fontWeight||"bold")==="bold"?"normal":"bold"})}><Bold size={16}/></button><button title="Kursiv" aria-label="Kursiv" aria-pressed={selected.fontStyle==="italic"} onClick={()=>patchElement(selected.id,{fontStyle:selected.fontStyle==="italic"?"normal":"italic"})}><Italic size={16}/></button></div></div><div className="prop-label">Ausrichtung<div className="editor-segmented"><button title="Linksbündig" aria-label="Linksbündig" aria-pressed={(selected.textAlign||"left")==="left"} onClick={()=>patchElement(selected.id,{textAlign:"left"})}><AlignLeft size={16}/></button><button title="Zentriert" aria-label="Zentriert" aria-pressed={selected.textAlign==="center"} onClick={()=>patchElement(selected.id,{textAlign:"center"})}><AlignCenter size={16}/></button><button title="Rechtsbündig" aria-label="Rechtsbündig" aria-pressed={selected.textAlign==="right"} onClick={()=>patchElement(selected.id,{textAlign:"right"})}><AlignRight size={16}/></button></div></div><div className="prop-label">Textfarbe<Palette value={selected.color||"#17233d"} options={inkColors} onChange={color=>patchElement(selected.id,{color})} label="Textfarbe"/><input type="color" aria-label="Eigene Textfarbe" value={/^#[\da-f]{6}$/i.test(selected.color||"")?selected.color:"#17233d"} onChange={e=>patchElement(selected.id,{color:e.target.value})}/></div></>}
           {selected.kind==="shape"&&<><label className="prop-label">Form<select value={selected.shape||"rectangle"} onChange={e=>patchElement(selected.id,{shape:e.target.value as SlideElement["shape"]})}><option value="rectangle">Rechteck</option><option value="circle">Kreis</option><option value="line">Linie</option></select></label><div className="prop-label">Füllfarbe<Palette value={selected.background||"#b9a6ff"} options={["#b9a6ff","#ffca55","#f27388","#64cfb3","#72bdf2","#17233d"]} onChange={background=>patchElement(selected.id,{background})} label="Füllfarbe"/><input type="color" aria-label="Eigene Füllfarbe" value={/^#[\da-f]{6}$/i.test(selected.background||"")?selected.background:"#b9a6ff"} onChange={e=>patchElement(selected.id,{background:e.target.value})}/></div></>}
           {selected.kind==="table"&&<label className="prop-label">Tabelle · Zellen mit | trennen<textarea rows={4} value={(selected.rows||[]).map(r=>r.join(" | ")).join("\n")} onChange={e=>patchElement(selected.id,{rows:e.target.value.split("\n").map(r=>r.split("|").map(c=>c.trim()))})}/></label>}
           {selected.kind==="chart"&&<label className="prop-label">Diagrammdaten · Name | Wert<textarea rows={4} value={(selected.points||[]).map(p=>`${p.label} | ${p.value}`).join("\n")} onChange={e=>patchElement(selected.id,{points:e.target.value.split("\n").map(r=>{const [label,value]=r.split("|");return{label:label?.trim()||"",value:Number(value)||0};})})}/></label>}
@@ -300,7 +337,7 @@ export function Editor({presentation,onChange,onBack,onLive,isCloud,saving,saveE
       </aside>
     </div>
     {notice&&<div className="editor-notice" role="status">{notice}<button onClick={()=>setNotice("")}>Schließen</button></div>}
-    {chooser&&<div className="editor-dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)setChooser(false);}}><section className="editor-dialog" role="dialog" aria-modal="true" aria-labelledby="editor-dialog-title"><header><div><span className="editor-dialog-eyebrow">LOS GEHT’S</span><h2 id="editor-dialog-title">Was möchtest du erstellen?</h2><p>Wähle einen Startpunkt. Deine bestehenden Folien bleiben unverändert.</p></div><button className="icon-button" aria-label="Schließen" onClick={()=>setChooser(false)}><X size={20}/></button></header><div className="editor-dialog-content"><h3>Fertige Layouts <small>Für eine neue Folie</small></h3><div className="editor-template-grid">{templates.map(t=><button key={t.id} onClick={()=>addSlide("standard",t.id)}><span className={`editor-template-art template-${t.id}`}><i/><i/><i/></span><strong>{t.title}</strong><small>{t.detail}</small></button>)}</div><h3>Oder einen Folientyp wählen</h3>{typeGroups.map(group=><div className="editor-type-group" key={group.label}><h4>{group.label}</h4><div className="editor-type-grid">{group.items.map(item=><button key={item.type} onClick={()=>addSlide(item.type)}><strong>{slideTypeLabels[item.type]}</strong><small>{item.description}</small><Plus size={16}/></button>)}</div></div>)}</div></section></div>}
+    {chooser&&<div className="editor-dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)setChooser(false);}}><section className="editor-dialog" role="dialog" aria-modal="true" aria-labelledby="editor-dialog-title"><header><div><span className="editor-dialog-eyebrow">LOS GEHT’S</span><h2 id="editor-dialog-title">Was möchtest du erstellen?</h2><p>Wähle einen Startpunkt. Deine bestehenden Folien bleiben unverändert.</p></div><button className="icon-button" aria-label="Schließen" onClick={()=>setChooser(false)}><X size={20}/></button></header><div className="editor-dialog-content"><h3>Komplette Decks <small>3 zusammenpassende Folien</small></h3><div className="editor-deck-grid"><button className="editor-deck-card deck-aurora" onClick={()=>addTemplateDeck("aurora")}><strong>Aurora</strong><span>Leuchten, weich, modern</span><b>Deck hinzufügen →</b></button><button className="editor-deck-card deck-tech" onClick={()=>addTemplateDeck("tech")}><strong>Tech</strong><span>Kontrast, Code, Klarheit</span><b>Deck hinzufügen →</b></button><button className="editor-deck-card deck-book" onClick={()=>addTemplateDeck("book")}><strong>Book</strong><span>Editorial und elegant</span><b>Deck hinzufügen →</b></button></div><h3>Fertige Layouts <small>Für eine neue Folie</small></h3><div className="editor-template-grid">{templates.map(t=><button key={t.id} onClick={()=>addSlide("standard",t.id)}><span className={`editor-template-art template-${t.id}`}><i/><i/><i/></span><strong>{t.title}</strong><small>{t.detail}</small></button>)}</div><h3>Oder einen Folientyp wählen</h3>{typeGroups.map(group=><div className="editor-type-group" key={group.label}><h4>{group.label}</h4><div className="editor-type-grid">{group.items.map(item=><button key={item.type} onClick={()=>addSlide(item.type)}><strong>{slideTypeLabels[item.type]}</strong><small>{item.description}</small><Plus size={16}/></button>)}</div></div>)}</div></section></div>}
     {preview&&<div className="preview-overlay"><header><span><Eye size={17}/> Vorschau</span><button className="icon-button" aria-label="Vorschau schließen" onClick={()=>setPreview(false)}><X size={20}/></button></header><div className="preview-view"><div className="preview-main">{slide&&<SlideStage slide={slide} preview/>}<div className="preview-nav"><button className="button secondary" disabled={slideIndex===0} onClick={()=>navigate(-1)}>Zurück</button><span>{slideIndex+1} / {doc.slides.length}</span><button className="button primary" disabled={slideIndex===doc.slides.length-1} onClick={()=>navigate(1)}>Weiter</button></div><p className="preview-shortcuts">Mit ← und → navigieren · Esc zum Schließen</p></div></div></div>}
   </div>;
 }

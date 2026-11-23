@@ -55,6 +55,10 @@ export interface SlideElement {
   fontStyle?: "normal" | "italic";
   textAlign?: "left" | "center" | "right";
   objectFit?: "cover" | "contain";
+  objectPosition?: string;
+  opacity?: number;
+  borderRadius?: number;
+  fontFamily?: "sans" | "display" | "serif" | "mono" | "rounded";
 }
 
 export interface SlideContent {
