@@ -100,6 +100,9 @@ export default function App() {
     localStorage.setItem("plexia-studio-theme", theme);
   }, [theme]);
   useEffect(() => {
+    document.documentElement.dataset.plexiaView = active ? "editor" : "app";
+  }, [active]);
+  useEffect(() => {
     const onTransfer = (event: Event) => {
       const detail = (event as CustomEvent<{ phase: "progress" | "success" | "error"; message: string }>).detail;
       if (detail) setToast({ kind: detail.phase === "error" ? "error" : "success", text: detail.message });
