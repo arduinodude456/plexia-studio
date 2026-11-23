@@ -72,6 +72,9 @@ export interface SlideContent {
   maxPoints?: number;
   chartType?: "bar" | "pie";
   groupSize?: number;
+  /** Positive whole seconds (maximum 86400); omitted means no time limit. */
+  timeLimitSeconds?: number;
+  wordFilter?: { mode: "off" | "blacklist" | "whitelist"; match: "exact" | "contains"; terms: string[] };
   [key: string]: unknown;
 }
 
@@ -91,6 +94,9 @@ export interface Presentation {
   title: string;
   description: string;
   theme: "light" | "dark" | "ocean" | "violet";
+  participation?: { avatarsEnabled?: boolean; nicknameGeneratorEnabled?: boolean };
+  /** Path in the private presentation-media bucket, not a public URL. */
+  backgroundImage?: string;
   slides: PlexiaSlide[];
   version: 1;
   updatedAt: string;
@@ -103,8 +109,15 @@ export interface ClassSession {
   status: SessionStatus;
   currentSlideIndex: number;
   activityStatus: ActivityStatus;
+  /** Server-owned deadline; null when paused, ended or unlimited. */
+  activityDeadline?: string | null;
   createdAt: string;
 }
+
+/** Students may send legacy {choices: string[]} or unambiguous zero-based indices. */
+export interface QuizAnswer { choiceIndices: number[]; choices?: string[] }
+export interface JoinOptions { avatarsEnabled: boolean; nicknameGeneratorEnabled: boolean }
+export interface RankingEntry { nickname: string; avatar: string | null; correctCount: number }
 
 export interface SessionGroupAssignment {
   sessionId: string;

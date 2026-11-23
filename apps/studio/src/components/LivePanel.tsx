@@ -9,7 +9,6 @@ import {
   Image as ImageIcon,
   LoaderCircle,
   Maximize2,
-  Minimize2,
   QrCode,
   Radio,
   ScanText,
@@ -23,6 +22,8 @@ import {
   createClassSession,
   createSnapshotScheduler,
   getClassSession,
+  getServerClock,
+  estimateServerTime,
   listSessionParticipants,
   createSignedStudentPhotoUrl,
   groqProxy,
@@ -37,16 +38,19 @@ import {
   updateTeacherReview,
   type ClassSession,
   type Presentation,
+  type ServerClockSample,
   type StudentResponse,
   type SyncedClassSession,
 } from "@plexia/shared";
 import { SlideStage } from "./SlideStage";
-import { LiveSlideOverlay } from "./LiveSlideOverlay";
+import { LiveSlideOverlay, type RankingEntry } from "./LiveSlideOverlay";
 import "./LivePanel.css";
 
 interface Props {
   presentation: Presentation;
   onClose: () => void;
+  onPrepareStart: () => Promise<Presentation>;
+  saveError?: string;
   onShareResults: (slideId: string, results: SharedSlideResult[]) => Promise<void>;
 }
 
@@ -62,7 +66,7 @@ interface HandwritingReading {
   confidence?: number;
 }
 
-interface PrivateQuizKey { slideId: string; correctIndex: number; explanation: string }
+interface PrivateQuizKey { slideId: string; correctIndices: number[]; explanation: string }
 interface LiveParticipant { userId: string; nickname: string; joinedAt: string }
 export interface SharedSlideResult { slideId: string; title: string; responseCount: number; options?: Array<{ label: string; count: number }> }
 
@@ -77,7 +81,7 @@ export function stripPrivateAnswerFields(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripPrivateAnswerFields);
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-    .filter(([key]) => !["correctIndex", "correct_index", "answerKey", "answer_key", "explanation"].includes(key))
+    .filter(([key]) => !["correctIndex", "correct_index", "correctIndices", "correct_indices", "answerKey", "answer_key", "explanation"].includes(key))
     .map(([key, child]) => [key, stripPrivateAnswerFields(child)]));
 }
 
@@ -98,10 +102,23 @@ function responseText(response: StudentResponse): string {
   }
 }
 
-function choicesFor(response: StudentResponse): string[] {
-  const choices = response.answerJson?.choices;
-  if (Array.isArray(choices)) return choices.filter((value): value is string => typeof value === "string");
-  return response.answerText.split(",").map((value) => value.trim()).filter(Boolean);
+function choiceIndicesFor(response: StudentResponse, options: string[]): number[] | null {
+  const indices = response.answerJson?.choiceIndices;
+  if (Array.isArray(indices)) {
+    if (indices.some((value) => typeof value !== "number" || !Number.isInteger(value) || value < 0 || value >= options.length)) return null;
+    return new Set(indices).size === indices.length ? indices : null;
+  }
+  const jsonChoices = response.answerJson?.choices;
+  const choices: unknown[] = Array.isArray(jsonChoices) ? jsonChoices : response.answerText.split(",").map((value) => value.trim()).filter(Boolean);
+  const result: number[] = [];
+  for (const value of choices) {
+    if (typeof value !== "string") return null;
+    const index = options.indexOf(value);
+    // Text-based answers are valid only if the label identifies exactly one option.
+    if (index < 0 || options.lastIndexOf(value) !== index || result.includes(index)) return null;
+    result.push(index);
+  }
+  return result;
 }
 
 function ideasFor(response: StudentResponse): string[] {
@@ -110,15 +127,38 @@ function ideasFor(response: StudentResponse): string[] {
   return source.filter((value): value is string => typeof value === "string").map((value) => value.trim().slice(0, 180)).filter(Boolean);
 }
 
-function wordFrequencies(responses: StudentResponse[]): Array<{ word: string; count: number }> {
-  const stop = new Set("aber alle als also am an andere auch auf aus bei beim bin bis bist da dadurch daher damit dann das dass dein deine dem den der des die dies doch dort du durch ein eine einem einen einer eines er es etwas für gegen gewesen hat hatte haben hier hinter ich im in ist ja jede jeder jedes kann kein keine mit nach nicht noch nun oder sein seine sich sie sind so über um und uns unter vom von vor war waren was weg weil weiter welche wenn werde werden wie wieder wir wo zu zum zur".split(" "));
+function normalizeWord(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase("de-DE").trim().replace(/\s+/gu, " ");
+}
+
+function wordFrequencies(responses: StudentResponse[], filter: unknown): Array<{ word: string; count: number }> {
+  const config = filter && typeof filter === "object" ? filter as Record<string, unknown> : {};
+  const mode = config.mode === "blacklist" || config.mode === "whitelist" ? config.mode : "off";
+  const match = config.match === "contains" ? "contains" : "exact";
+  const terms = Array.isArray(config.terms)
+    ? config.terms.filter((term): term is string => typeof term === "string").map(normalizeWord).filter(Boolean)
+    : [];
   const counts = new Map<string, number>();
-  for (const response of responses) for (const idea of ideasFor(response)) {
-    for (const word of idea.toLocaleLowerCase("de").normalize("NFKC").match(/[\p{L}\p{N}-]{3,}/gu) ?? []) {
-      if (!stop.has(word)) counts.set(word, (counts.get(word) ?? 0) + 1);
+  for (const response of responses) {
+    // A contribution is an entire term or phrase, not separate tokens. Legacy
+    // text joins separate ideas with newlines; commas remain part of a phrase.
+    const ideas = Array.isArray(response.answerJson?.ideas) ? response.answerJson.ideas : response.answerText.split("\n");
+    for (const idea of ideas) {
+      if (typeof idea !== "string") continue;
+      const phrase = normalizeWord(idea);
+      if (!phrase) continue;
+      const matches = terms.some((term) => match === "contains" ? phrase.includes(term) : phrase === term);
+      if (mode === "blacklist" && matches || mode === "whitelist" && !matches) continue;
+      const displayed = phrase.slice(0, 180);
+      counts.set(displayed, (counts.get(displayed) ?? 0) + 1);
     }
   }
   return [...counts].map(([word, count]) => ({ word, count })).sort((a, b) => b.count - a.count || a.word.localeCompare(b.word, "de")).slice(0, 40);
+}
+
+function exactlyMatchesQuizKey(response: StudentResponse, options: string[], key: PrivateQuizKey): boolean {
+  const chosen = choiceIndicesFor(response, options);
+  return Boolean(chosen && chosen.length > 0 && chosen.length === key.correctIndices.length && key.correctIndices.every((index) => chosen.includes(index)));
 }
 
 function stableHash(value: string): number {
@@ -133,7 +173,7 @@ function buildGroupAssignment(sessionId: string, slideId: string, participants: 
   return Object.fromEntries(shuffled.map((participant, index) => [participant.userId, (index % numberOfGroups) + 1]));
 }
 
-export function LivePanel({ presentation, onClose, onShareResults }: Props) {
+export function LivePanel({ presentation, onClose, onPrepareStart, onShareResults, saveError }: Props) {
   const [session, setSession] = useState<SyncedClassSession | null>(null);
   const storageKey = `plexia.studio.live.${presentation.id}`;
   const [restoring, setRestoring] = useState(true);
@@ -144,12 +184,19 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
   const [dataSyncError, setDataSyncError] = useState("");
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  const startLock = useRef(false);
+  const [, setClockTick] = useState(0);
+  const [clock, setClock] = useState<{ key: string; sample: ServerClockSample } | null>(null);
   const [updatingSession, setUpdatingSession] = useState(false);
   const sessionUpdateLock = useRef(false);
   const requestSnapshot = useRef<(invalidate?: boolean) => void>(() => {});
   const [isOnline, setIsOnline] = useState(() => navigator.onLine);
   const [ending, setEnding] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
+  const liveRootRef = useRef<HTMLDivElement>(null);
+  const presentationModeRef = useRef(false);
+  const enteredNativeFullscreen = useRef(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [selected, setSelected] = useState("");
@@ -189,6 +236,7 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
   const [sharingResults, setSharingResults] = useState(false);
   const sharingResultsLock = useRef(false);
   const [shareNotice, setShareNotice] = useState("");
+  const [ranking, setRanking] = useState<{ sessionId: string; slideId: string; rows: RankingEntry[]; loading: boolean; error: boolean } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -279,19 +327,36 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
     scheduler.request();
 
     if (supabase) {
-      void supabase.from("teacher_quiz_keys").select("slide_id,correct_index,explanation")
-        .eq("presentation_id", session.presentationId)
-        .then(({ data, error: keyError }) => {
-          if (!active) return;
-          if (keyError) {
-            setQuizKeyNotice("Private Quiz-Schlüssel nicht verfügbar. Prüfe die Datenbankkonfiguration und die Lehrkraft-RLS.");
-            return;
-          }
-          setPrivateQuizKeys((data ?? []).map((row) => ({
-            slideId: String(row.slide_id), correctIndex: Number(row.correct_index), explanation: String(row.explanation ?? ""),
-          })).filter((row) => Number.isInteger(row.correctIndex) && row.correctIndex >= 0));
-          setQuizKeyNotice("");
-        });
+      const client = supabase;
+      setPrivateQuizKeys([]);
+      void (async () => {
+        const result = await client.from("teacher_quiz_keys").select("slide_id,correct_index,correct_indices,explanation")
+          .eq("presentation_id", session.presentationId);
+        let rows: Array<{ slide_id: unknown; correct_index: unknown; correct_indices?: unknown; explanation: unknown }> | null = result.data;
+        let keyError = result.error;
+        // An unmigrated installation still supports its original single-answer keys.
+        if (keyError && (keyError.code === "42703" || keyError.code === "PGRST204")) {
+          const legacyResult = await client.from("teacher_quiz_keys").select("slide_id,correct_index,explanation")
+            .eq("presentation_id", session.presentationId);
+          rows = legacyResult.data;
+          keyError = legacyResult.error;
+        }
+        if (!active) return;
+        if (keyError) {
+          setQuizKeyNotice("Private Quiz-Schlüssel nicht verfügbar. Prüfe die Datenbankkonfiguration und die Lehrkraft-RLS.");
+          return;
+        }
+        const keys: PrivateQuizKey[] = [];
+        for (const row of rows ?? []) {
+          const values: unknown = row.correct_indices;
+          const legacy = row.correct_index;
+          const candidates: unknown[] = Array.isArray(values) ? values : values == null ? [legacy] : [];
+          if (candidates.some((value) => typeof value !== "number" || !Number.isInteger(value) || value < 0)) continue;
+          keys.push({ slideId: String(row.slide_id), correctIndices: [...new Set(candidates as number[])], explanation: String(row.explanation ?? "") });
+        }
+        setPrivateQuizKeys(keys);
+        setQuizKeyNotice("");
+      })();
     }
     return () => {
       active = false;
@@ -307,20 +372,24 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
   }, [session?.id, session?.presentationId]);
 
   const start = useCallback(async () => {
+    if (startLock.current) return;
+    startLock.current = true;
     setBusy(true);
     setError("");
     try {
-      const studentSafePresentation = stripPrivateAnswerFields(presentation) as Presentation;
+      const checkedPresentation = await onPrepareStart();
+      const studentSafePresentation = stripPrivateAnswerFields(checkedPresentation) as Presentation;
       const created = await createClassSession(studentSafePresentation);
       try { sessionStorage.setItem(storageKey, created.id); } catch { /* no storage */ }
       setSession(created);
-      setNotice("Sitzung gestartet. Teile den Code mit deiner Klasse.");
+      setNotice(created.activityStatus === "idle" ? "Sitzung erstellt. Teile den Code und starte die zeitbegrenzte Aktivität erst nach dem Beitritt der Klasse." : "Sitzung gestartet. Teile den Code mit deiner Klasse.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Die Sitzung konnte nicht gestartet werden.");
     } finally {
+      startLock.current = false;
       setBusy(false);
     }
-  }, [presentation, storageKey]);
+  }, [presentation, storageKey, onPrepareStart]);
 
   async function patch(p: Partial<Pick<ClassSession, "status" | "currentSlideIndex" | "activityStatus">>) {
     if (!session || sessionUpdateLock.current || ending) return;
@@ -365,20 +434,49 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
     onClose();
   }
 
-  async function toggleFullscreen() {
-    try {
-      if (document.fullscreenElement) await document.exitFullscreen();
-      else if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
-      else throw new Error("Der Vollbildmodus wird von diesem Browser nicht unterstützt.");
-    } catch (e) {
-      setNotice(e instanceof Error ? e.message : "Vollbild konnte nicht aktiviert werden.");
+  const exitPresentation = useCallback(() => {
+    presentationModeRef.current = false;
+    setIsFullscreen(false);
+    setIsNativeFullscreen(false);
+    if (document.fullscreenElement === liveRootRef.current && document.exitFullscreen) {
+      void document.exitFullscreen().catch(() => {});
     }
+  }, []);
+
+  async function toggleFullscreen() {
+    if (presentationModeRef.current) { exitPresentation(); return; }
+    const root = liveRootRef.current;
+    if (!root) return;
+    presentationModeRef.current = true;
+    setIsFullscreen(true);
+    try {
+      // Keep a full-viewport slide-only mode if the API is unavailable or denied.
+      if (root.requestFullscreen) {
+        await root.requestFullscreen();
+        if (!presentationModeRef.current && document.fullscreenElement === root) await document.exitFullscreen();
+      }
+    } catch { /* CSS viewport fallback remains available. */ }
   }
 
   useEffect(() => {
-    const syncFullscreen = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    const root = liveRootRef.current;
+    const syncFullscreen = () => {
+      setIsNativeFullscreen(Boolean(root && document.fullscreenElement === root));
+      if (document.fullscreenElement === root) enteredNativeFullscreen.current = true;
+      else if (enteredNativeFullscreen.current) {
+        enteredNativeFullscreen.current = false;
+        // Includes the browser's own Escape and fullscreen-exit controls.
+        if (presentationModeRef.current) {
+          presentationModeRef.current = false;
+          setIsFullscreen(false);
+        }
+      }
+    };
     document.addEventListener("fullscreenchange", syncFullscreen);
-    return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+    return () => {
+      document.removeEventListener("fullscreenchange", syncFullscreen);
+      if (root && document.fullscreenElement === root && document.exitFullscreen) void document.exitFullscreen().catch(() => {});
+    };
   }, []);
 
   async function evaluate(response: StudentResponse) {
@@ -467,6 +565,41 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
 
   const currentIndex = session?.currentSlideIndex ?? 0;
   const current = presentation.slides[currentIndex];
+  const clockKey = `${session?.id}|${session?.status}|${session?.activityStatus}|${session?.activityDeadline}|${isOnline}`;
+  useEffect(() => {
+    setClock(null);
+    if (!session?.activityDeadline || session.status !== "live" || session.activityStatus !== "running" || !isOnline) return;
+    let active = true, revision = 0;
+    const refresh = (clear = false) => {
+      const request = ++revision;
+      if (clear) setClock(null);
+      void getServerClock().then(sample => {
+        if (active && request === revision) setClock({ key: clockKey, sample });
+      }).catch(() => { if (active && request === revision) setClock(null); });
+    };
+    const resume = () => {
+      if (!navigator.onLine || document.visibilityState !== "visible") { revision += 1; setClock(null); }
+      else refresh(true);
+    };
+    if (document.visibilityState === "visible") refresh();
+    const ticker = window.setInterval(() => setClockTick(value => value + 1), 1000);
+    const refresher = window.setInterval(() => { if (navigator.onLine && document.visibilityState === "visible") refresh(); }, 15_000);
+    window.addEventListener("online", resume); window.addEventListener("offline", resume); window.addEventListener("focus", resume);
+    document.addEventListener("visibilitychange", resume);
+    return () => {
+      active = false; revision += 1; window.clearInterval(ticker); window.clearInterval(refresher);
+      window.removeEventListener("online", resume); window.removeEventListener("offline", resume); window.removeEventListener("focus", resume);
+      document.removeEventListener("visibilitychange", resume);
+    };
+  }, [clockKey]);
+  const timed = typeof current?.content.timeLimitSeconds === "number";
+  const runningTimer = session?.status === "live" && session?.activityStatus === "running";
+  const deadline = session?.activityDeadline ? Date.parse(session.activityDeadline) : NaN;
+  const serverNow = clock?.key === clockKey ? estimateServerTime(clock.sample) : null;
+  const remainingMs = runningTimer ? (Number.isFinite(deadline) && serverNow !== null ? Math.max(0, deadline - serverNow) : null) : session?.activityRemainingMs ?? null;
+  const remainingSeconds = remainingMs !== null && Number.isFinite(remainingMs) ? Math.max(0, Math.ceil(remainingMs / 1000)) : null;
+  const timeText = remainingSeconds === null ? "Zeitstand nicht verfügbar" : [Math.floor(remainingSeconds / 3600), Math.floor(remainingSeconds / 60) % 60, remainingSeconds % 60].map(part => String(part).padStart(2,"0")).join(":");
+  const timerLabel = !session || session.status === "ended" ? "Beendet" : runningTimer ? remainingSeconds === 0 ? "Zeit abgelaufen" : "Restzeit (ca.)" : session.activityStatus === "idle" ? "Bereit – noch nicht gestartet" : "Pausiert";
   const previousSlideIndex = useRef(currentIndex);
   const slideDirection = currentIndex < previousSlideIndex.current ? "back" : "forward";
   useEffect(() => { previousSlideIndex.current = currentIndex; }, [currentIndex]);
@@ -474,22 +607,77 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
   const currentSelectedResponse = responses.find((item) => item.id === selected);
   const currentSlideResponses = current ? responses.filter((response) => response.slideId === current.id) : [];
   const currentSlideIsInteractive = Boolean(current && ["multiple_choice", "poll", "free_text", "worksheet", "photo_task", "group_work", "mindmap", "brainstorm", "wordcloud"].includes(current.type));
-  const currentQuizKey = current ? privateQuizKeys.find((item) => item.slideId === current.id) : undefined;
-  const currentOptions = Array.isArray(current?.content.options) ? current.content.options.filter((item): item is string => typeof item === "string") : [];
+  const currentOptions = Array.isArray(current?.content.options) && current.content.options.every((item) => typeof item === "string") ? current.content.options : [];
+  const currentQuizKey = current ? privateQuizKeys.find((item) => item.slideId === current.id && item.correctIndices.length > 0 && item.correctIndices.every((index) => index < currentOptions.length)) : undefined;
   const optionCounts = currentOptions.map((label, index) => ({
     label,
-    count: currentSlideResponses.filter((response) => choicesFor(response).includes(label)).length,
-    correct: currentQuizKey?.correctIndex === index,
+    count: currentSlideResponses.filter((response) => choiceIndicesFor(response, currentOptions)?.includes(index)).length,
+    correct: currentQuizKey?.correctIndices.includes(index),
   }));
   const ideasByResponse = currentSlideResponses.flatMap((response) => ideasFor(response).map((idea) => ({ idea, nickname: safeText(response.nickname, 24).trim() || "Teilnehmer" })));
-  const frequencyWords = wordFrequencies(currentSlideResponses);
+  const legacyFilter = presentation as Presentation & { wordFilter?: unknown; settings?: { wordFilter?: unknown } };
+  const frequencyWords = wordFrequencies(currentSlideResponses, current?.content.wordFilter ?? legacyFilter.wordFilter ?? legacyFilter.settings?.wordFilter);
+  const backgroundImage = (presentation as Presentation & { backgroundImage?: string }).backgroundImage;
+  const visibleRanking = ranking?.sessionId === session?.id && ranking?.slideId === current?.id
+    ? ranking : { rows: [], loading: true, error: false };
   const assignment = current ? groupAssignments[current.id] : undefined;
   const assignedGroups = assignment ? [...new Set(Object.values(assignment))].sort((a, b) => a - b) : [];
   const realtimeDisconnected = !isOnline || ["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(realtimeStatus);
 
   useEffect(() => {
-    if (!session || session.status === "ended") return;
+    if (!session?.id || current?.type !== "results" || !supabase) return;
+    const client = supabase;
+    const sessionId = session.id;
+    const slideId = current.id;
+    let active = true;
+    let inFlight = false;
+    setRanking({ sessionId, slideId, rows: [], loading: true, error: false });
+    const refresh = async () => {
+      if (!active || inFlight) return;
+      inFlight = true;
+      try {
+        const { data, error: rankingError } = await client.rpc("get_session_ranking", { p_session_id: sessionId });
+        if (rankingError) throw rankingError;
+        if (!active) return;
+        const rows: RankingEntry[] = (Array.isArray(data) ? data : []).flatMap((item: unknown) => {
+          if (!item || typeof item !== "object") return [];
+          const row = item as Record<string, unknown>;
+          const count = Number(row.correct_count);
+          const nickname = safeText(row.nickname, 24).trim();
+          if (!nickname || !Number.isFinite(count) || count < 0) return [];
+          // Avatars are displayed as text only, never fetched as external URLs.
+          const avatar = safeText(row.avatar, 16).replace(/[\u0000-\u001f\u007f]/g, "").trim();
+          return [{ nickname, avatar: /[:/\\]/.test(avatar) ? "" : avatar, correctCount: Math.trunc(count) }];
+        }).sort((a: RankingEntry, b: RankingEntry) => b.correctCount - a.correctCount);
+        setRanking({ sessionId, slideId, rows, loading: false, error: false });
+      } catch {
+        if (active) setRanking({ sessionId, slideId, rows: [], loading: false, error: true });
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 3500);
+    const resume = () => { if (document.visibilityState === "visible") void refresh(); };
+    window.addEventListener("focus", resume);
+    document.addEventListener("visibilitychange", resume);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", resume);
+      document.removeEventListener("visibilitychange", resume);
+    };
+  }, [session?.id, current?.id, current?.type]);
+
+  useEffect(() => {
+    if (!session) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && presentationModeRef.current) {
+        event.preventDefault();
+        exitPresentation();
+        return;
+      }
+      if (session.status === "ended") return;
       const target = event.target;
       if (target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
       if (event.altKey || event.ctrlKey || event.metaKey) return;
@@ -503,7 +691,7 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [session?.id, session?.status, currentIndex, presentation.slides.length]);
+  }, [session, currentIndex, presentation.slides.length, ending, exitPresentation]);
 
   async function assignGroups() {
     if (!session || !current || !supabase) return;
@@ -548,7 +736,7 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
           const slideResponses = responses.filter((response) => response.slideId === slide.id);
           if (slide.type === "multiple_choice" || slide.type === "poll") {
             const options = Array.isArray(slide.content.options) ? slide.content.options.filter((option): option is string => typeof option === "string") : [];
-            return { slideId: slide.id, title: safeText(slide.title, 160), responseCount: slideResponses.length, options: options.map((label) => ({ label: safeText(label, 200), count: slideResponses.filter((response) => choicesFor(response).includes(label)).length })) };
+            return { slideId: slide.id, title: safeText(slide.title, 160), responseCount: slideResponses.length, options: options.map((label, index) => ({ label: safeText(label, 200), count: slideResponses.filter((response) => choiceIndicesFor(response, options)?.includes(index)).length })) };
           }
           return { slideId: slide.id, title: safeText(slide.title, 160), responseCount: slideResponses.length };
         });
@@ -645,7 +833,8 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
   })();
 
   return (
-    <div className="live-overlay">
+    <div className="live-overlay" ref={liveRootRef}>
+      {!isFullscreen && <>
       <header className="live-top">
         <button className="live-brand" onClick={closeLive}>
           <span className="brand-symbol small">P</span> PLEXIA <span className="brand-light">LIVE</span>
@@ -655,10 +844,11 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
           {session ? session.status === "live" ? "Sitzung live" : session.status === "paused" ? "Sitzung pausiert" : "Sitzung beendet" : "Nicht gestartet"}
         </div>
         {session && <div className={`live-realtime ${isOnline && realtimeStatus === "SUBSCRIBED" ? "connected" : realtimeDisconnected ? "disconnected" : ""}`} title={realtimeDisconnected ? "Live-Push nicht verfügbar; bei bestehender Internetverbindung wird regelmäßig abgeglichen." : undefined}><i />{!isOnline ? "Offline" : realtimeStatus === "SUBSCRIBED" ? "Live-Push verbunden" : realtimeDisconnected ? "Live-Push unterbrochen" : "Verbinde…"}</div>}
-        {session && <button className="icon-button live-fullscreen" onClick={() => void toggleFullscreen()} aria-label={isFullscreen ? "Vollbild verlassen" : "Vollbild"} title={isFullscreen ? "Vollbild verlassen" : "Vollbild"}>{isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}</button>}
+        {session && <button className="icon-button live-fullscreen" onClick={() => void toggleFullscreen()} aria-label="Vollbild starten; mit Escape verlassen" title="Vollbild starten; mit Escape verlassen"><Maximize2 size={18} /></button>}
         <button className="icon-button live-close" onClick={closeLive} aria-label="Live-Ansicht schließen"><X size={20} /></button>
       </header>
 
+      {saveError && <div className="notice warning" role="alert"><strong>Änderungen nicht gespeichert</strong><span>Die Liveansicht zeigt den zuletzt bestätigten Stand. {saveError} Falls eine laufende Sitzung Änderungen an Quizantworten oder Lösungen blockiert, beende sie und speichere erneut.</span></div>}
       {!hasSupabaseConfig ? (
         <main className="live-unconfigured">
           <div className="live-setup-icon"><Radio size={26} /></div>
@@ -676,7 +866,7 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
         <main className="live-launch">
           <div className="live-preview-card">
             <div className="live-preview-top"><span><i className="dot green" /> BEREIT ZUM TEILEN</span><span>{presentation.slides.length} Folien</span></div>
-            <div className="live-preview-canvas">{current && <SlideStage slide={current} preview />}</div>
+            <div className="live-preview-canvas">{current && <SlideStage slide={current} backgroundImage={backgroundImage} preview />}</div>
             <h2>{presentation.title}</h2>
             <p>{presentation.description || "Interaktive Präsentation für deine Klasse."}</p>
             <button className="button primary large" onClick={() => void start()} disabled={busy}>{busy ? <LoaderCircle className="spin" size={19} /> : <Radio size={19} />} Live-Sitzung starten</button>
@@ -695,14 +885,14 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
                 {session.status !== "ended" && <button className="button danger-button small-button" onClick={() => void endSession()} disabled={ending || updatingSession}>{ending ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />} {ending ? "Wird beendet…" : "Sitzung beenden"}</button>}
               </div>
             </div>
-            <div className="live-slide-frame">{current && <div key={`${session.id}-${current.id}`} className={`live-slide-transition ${slideDirection}`}><div className="live-stage-with-response-overlay"><SlideStage slide={current} preview /><LiveSlideOverlay slide={current} responseCount={currentSlideResponses.length} frequencyWords={frequencyWords} ideas={ideasByResponse} /></div></div>}</div>
+            <div className="live-slide-frame">{current && <div key={`${session.id}-${current.id}`} className={`live-slide-transition ${slideDirection}`}><div className="live-stage-with-response-overlay"><SlideStage slide={current} backgroundImage={backgroundImage} preview /><LiveSlideOverlay slide={current} responseCount={currentSlideResponses.length} frequencyWords={frequencyWords} ideas={ideasByResponse} ranking={visibleRanking} showAvatars={presentation.participation?.avatarsEnabled === true} /></div></div>}</div>
             <div className="live-slide-nav" aria-label="Foliennavigation">
               <button className="button secondary" disabled={currentIndex <= 0 || session.status === "ended" || updatingSession} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
               <span>Folie <b>{currentIndex + 1}</b> / {presentation.slides.length}</span>
               <button className="button primary" disabled={currentIndex >= presentation.slides.length - 1 || session.status === "ended" || updatingSession} onClick={() => void patch({ currentSlideIndex: currentIndex + 1 })}>Weiter →</button>
             </div>
             <div className="activity-control">
-              <div className="activity-title"><Activity size={18} /><div><strong>Interaktion</strong><small>{session.activityStatus === "running" ? "Aktivität läuft" : "Aktivität pausiert oder wartet"}</small></div></div>
+              <div className="activity-title"><Activity size={18} /><div><strong>Interaktion</strong><small>{session.activityStatus === "running" ? "Aktivität läuft" : "Aktivität pausiert oder wartet"}</small>{timed && <small role="timer" title="Frist und Uhrzeit werden vom Server abgeglichen; die Anzeige kann sich durch Netzwerklaufzeit geringfügig unterscheiden.">{timerLabel}: {timeText}{realtimeDisconnected ? " · Verbindung prüfen" : ""}</small>}</div></div>
               <button className={`button ${session.activityStatus === "running" ? "secondary" : "mint-button"}`} disabled={session.status === "ended" || updatingSession || ending} onClick={() => void patch({ activityStatus: session.activityStatus === "running" ? "paused" : "running" })}>{session.activityStatus === "running" ? <><CirclePause size={16} /> Aktivität pausieren</> : <><CirclePlay size={16} /> Aktivität starten</>}</button>
             </div>
           </section>
@@ -710,7 +900,7 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
           <aside className="live-sidebar">
             <section className="join-card">
               <div className="join-card-title"><QrCode size={17} /><strong>Klasse beitreten</strong></div>
-              <div className="qr-wrap"><QRCodeSVG value={joinUrl} size={144} level="M" includeMargin /></div>
+              <div className="qr-wrap"><QRCodeSVG value={joinUrl} size={144} level="M" includeMargin fgColor="#352376" bgColor="#fff" /></div>
               <span className="join-label">DEIN BEITRITTS-CODE</span>
               <div className="join-code"><strong>{session.joinCode}</strong><button className="icon-button" onClick={() => void copyCode()} aria-label="Code kopieren">{copied ? <Check size={18} /> : <Copy size={18} />}</button></div>
               {copied && <small className="copied-message">Code in die Zwischenablage kopiert</small>}
@@ -757,12 +947,12 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12 }}>
                     <strong>{option.label}{option.correct ? " · richtig (Lehrkraft)" : ""}</strong><span>{option.count} · {currentSlideResponses.length ? Math.round(option.count / currentSlideResponses.length * 100) : 0}%</span>
                   </div>
-                  <div style={{ height: 8, borderRadius: 8, background: "var(--line)", overflow: "hidden", marginTop: 4 }}>
-                    <div style={{ height: "100%", width: `${currentSlideResponses.length ? option.count / currentSlideResponses.length * 100 : 0}%`, background: option.correct ? "#37ad8a" : "#7d6de2", transition: "width .25s ease" }} />
+                  <div style={{ height: 8, borderRadius: 8, background: "#ffc952", overflow: "hidden", marginTop: 4 }}>
+                    <div style={{ height: "100%", width: `${currentSlideResponses.length ? option.count / currentSlideResponses.length * 100 : 0}%`, background: option.correct ? "#352376" : "#5638bd", transition: "width .25s ease" }} />
                   </div>
                 </div>) : <p>Für diese Folie sind keine Auswahloptionen hinterlegt.</p>}
                 {current.type === "multiple_choice" && currentQuizKey
-                  ? <p><strong>Auswertung:</strong> {currentSlideResponses.filter((response) => choicesFor(response).includes(currentOptions[currentQuizKey.correctIndex] ?? "")).length} von {currentSlideResponses.length} richtig.{currentQuizKey.explanation && <> <strong>Erklärung:</strong> {currentQuizKey.explanation}</>}</p>
+                  ? <p><strong>Auswertung:</strong> {currentSlideResponses.filter((response) => exactlyMatchesQuizKey(response, currentOptions, currentQuizKey)).length} von {currentSlideResponses.length} richtig (alle und nur die richtigen Optionen).{currentQuizKey.explanation && <> <strong>Erklärung:</strong> {currentQuizKey.explanation}</>}</p>
                   : current.type === "multiple_choice" && <p className="live-ai-empty">Kein privater Lösungsschlüssel verfügbar; die Verteilung wird ohne Richtig/Falsch-Auswertung angezeigt.{quizKeyNotice && <> {quizKeyNotice}</>}</p>}
               </section>}
 
@@ -770,8 +960,8 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
                 <div className="live-ai-title"><Sparkles size={15} /><strong>{current.type === "mindmap" ? "Gemeinsame Mindmap" : current.type === "wordcloud" ? "Live-Wortwolke" : "Ideen aus der Klasse"}</strong></div>
                 <p>{currentSlideResponses.length} Teilnehmende · {ideasByResponse.length} Ideen — aktualisiert sich mit Antworten.</p>
                 {current.type === "wordcloud"
-                  ? frequencyWords.length ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 9, minHeight: 115, padding: 12, borderRadius: 10, background: "var(--surface)" }}>{frequencyWords.map(({ word, count }) => <span key={word} title={`${count}× genannt`} style={{ color: count > 1 ? "#6655c8" : "var(--ink)", fontWeight: 700, fontSize: `${Math.min(28, 12 + count * 4)}px`, padding: "3px 7px" }}>{word}<small style={{ fontSize: 10, marginLeft: 3 }}>×{count}</small></span>)}</div> : <p className="live-ai-empty">Noch keine verwertbaren Wörter.</p>
-                  : current.type === "mindmap" ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 8, minHeight: 110, padding: 12, borderRadius: 10, background: "var(--surface)" }}><strong style={{ borderRadius: 24, padding: "10px 14px", background: "#ece9ff", color: "#4c3eb0" }}>{safeText(current.content.prompt || current.title, 150)}</strong>{ideasByResponse.map(({ idea, nickname }, index) => <span key={`${index}-${idea}`} title={nickname} style={{ borderRadius: 20, padding: "7px 11px", background: index % 2 ? "#e3f7f2" : "#e7f4fb", color: "#30445f", fontSize: 12 }}>{idea}</span>)}</div>
+                  ? frequencyWords.length ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 9, minHeight: 115, padding: 12, borderRadius: 10, background: "var(--surface)" }}>{frequencyWords.map(({ word, count }) => <span key={word} title={`${count}× genannt`} style={{ color: count > 1 ? "var(--purple)" : "var(--ink)", fontWeight: 700, fontSize: `${Math.min(28, 12 + count * 4)}px`, padding: "3px 7px" }}>{word}<small style={{ fontSize: 10, marginLeft: 3 }}>×{count}</small></span>)}</div> : <p className="live-ai-empty">Noch keine verwertbaren Wörter.</p>
+                  : current.type === "mindmap" ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 8, minHeight: 110, padding: 12, borderRadius: 10, background: "var(--surface)" }}><strong style={{ borderRadius: 24, padding: "10px 14px", background: "#5638bd", color: "#fff" }}>{safeText(current.content.prompt || current.title, 150)}</strong>{ideasByResponse.map(({ idea, nickname }, index) => <span key={`${index}-${idea}`} title={nickname} style={{ borderRadius: 20, padding: "7px 11px", background: index % 2 ? "#ffc952" : "#5638bd", color: index % 2 ? "#352376" : "#fff", fontSize: 12 }}>{idea}</span>)}</div>
                   : ideasByResponse.length ? <ol style={{ paddingLeft: 24 }}>{ideasByResponse.map(({ idea, nickname }, index) => <li key={`${index}-${idea}`} style={{ margin: "7px 0", overflowWrap: "anywhere" }}><span>{idea}</span><small style={{ display: "block", color: "var(--muted)" }}>{nickname}</small></li>)}</ol> : <p className="live-ai-empty">Noch keine Ideen eingegangen.</p>}
               </section>}
 
@@ -790,7 +980,7 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
                 {presentation.slides.filter((slide) => ["multiple_choice", "poll", "mindmap", "brainstorm", "wordcloud", "group_work", "free_text", "worksheet", "photo_task"].includes(slide.type)).map((slide) => {
                   const slideResponses = responses.filter((response) => response.slideId === slide.id);
                   const options = Array.isArray(slide.content.options) ? slide.content.options.filter((value): value is string => typeof value === "string") : [];
-                  return <div key={slide.id} style={{ margin: "10px 0", padding: 10, borderRadius: 8, background: "var(--surface)" }}><strong>{safeText(slide.title, 160)}</strong><div>{slideResponses.length} Antworten</div>{options.length > 0 && <ul>{options.map((option) => <li key={option}>{option}: {slideResponses.filter((response) => choicesFor(response).includes(option)).length}</li>)}</ul>}</div>;
+                  return <div key={slide.id} style={{ margin: "10px 0", padding: 10, borderRadius: 8, background: "var(--surface)" }}><strong>{safeText(slide.title, 160)}</strong><div>{slideResponses.length} Antworten</div>{options.length > 0 && <ul>{options.map((option, index) => <li key={`${index}-${option}`}>{option}: {slideResponses.filter((response) => choiceIndicesFor(response, options)?.includes(index)).length}</li>)}</ul>}</div>;
                 })}
                 {shareNotice && <p role="status">{shareNotice}</p>}
                 <button className="button primary live-action-button" onClick={() => void shareAggregatedResults()} disabled={sharingResults || responses.length === 0}>{sharingResults ? <LoaderCircle className="spin" size={15} /> : <ExternalLink size={15} />}{sharingResults ? "Aggregat wird geteilt…" : "Aggregierte Resultate explizit teilen"}</button>
@@ -882,9 +1072,20 @@ export function LivePanel({ presentation, onClose, onShareResults }: Props) {
           </aside>
         </main>
       )}
+      </>}
 
-      {error && <div className="live-toast error">{error}<button onClick={() => setError("")}><X size={14} /></button></div>}
-      {notice && <div className="live-toast success">{notice}<button onClick={() => setNotice("")}><X size={14} /></button></div>}
+      {isFullscreen && session && <main className={`live-present-mode${isNativeFullscreen ? "" : " is-css-fallback"}`} aria-label="Präsentationsmodus. Mit Escape verlassen.">
+        <div className="live-present-stage">
+          {current && <div key={`${session.id}-${current.id}`} className={`live-slide-transition ${slideDirection}`}><div className="live-stage-with-response-overlay"><SlideStage slide={current} backgroundImage={backgroundImage} preview disableEmbeddedInteraction={!isNativeFullscreen} /><LiveSlideOverlay slide={current} responseCount={currentSlideResponses.length} frequencyWords={frequencyWords} ideas={ideasByResponse} ranking={visibleRanking} showAvatars={presentation.participation?.avatarsEnabled === true} /></div></div>}
+        </div>
+        <nav className="live-present-nav" aria-label="Foliennavigation im Vollbild">
+          <button type="button" className="button secondary" disabled={currentIndex <= 0 || session.status === "ended" || updatingSession || ending} onClick={() => void patch({ currentSlideIndex: currentIndex - 1 })}>← Zurück</button>
+          <button type="button" className="button primary" disabled={currentIndex >= presentation.slides.length - 1 || session.status === "ended" || updatingSession || ending} onClick={() => void patch({ currentSlideIndex: currentIndex + 1 })}>Weiter →</button>
+        </nav>
+      </main>}
+
+      {error && !isFullscreen && <div className="live-toast error">{error}<button onClick={() => setError("")}><X size={14} /></button></div>}
+      {notice && !isFullscreen && <div className="live-toast success">{notice}<button onClick={() => setNotice("")}><X size={14} /></button></div>}
     </div>
   );
 }

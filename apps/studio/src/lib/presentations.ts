@@ -2,6 +2,7 @@ import {
   hasSupabaseConfig,
   supabase,
   uploadPresentationMedia,
+  validatePresentationTimeLimits,
   type Presentation,
   type PlexiaSlide,
   type SlideElement,
@@ -121,7 +122,7 @@ function storagePathFromSignedUrl(value: string): string | null {
   } catch { return null; }
 }
 
-interface MediaLocation { mediaId: string; element?: SlideElement; slide?: PlexiaSlide; contentKey?: string; source: string; kind: "storage" | "inline" }
+interface MediaLocation { mediaId: string; element?: SlideElement; slide?: PlexiaSlide; contentKey?: string; background?: boolean; source: string; kind: "storage" | "inline" }
 interface MediaDescriptor { id: string; file: string; mimeType: string; size: number }
 interface PresentationArchive {
   format: typeof FORMAT;
@@ -129,8 +130,91 @@ interface PresentationArchive {
   presentation: Presentation;
   media: MediaDescriptor[];
 }
-export interface PrivateQuizKey { slideId: string; correctIndex: number; explanation: string }
-export interface ImportedPresentation { presentation: Presentation; privateQuizKeys: PrivateQuizKey[] }
+export interface PrivateQuizKey { slideId: string; correctIndex: number; correctIndices: number[]; explanation: string }
+export interface PendingQuizEdit { key: PrivateQuizKey; options: string[] }
+
+export function validateCloudMediaReferences(presentation: Presentation): void {
+  const check = (value: unknown, label: string) => {
+    if (typeof value === "string" && /^(blob:|data:|plexia-media:)/i.test(value)) {
+      throw new Error(`${label} ist nur lokal oder noch nicht hochgeladen. Bitte das Medium im Editor sicher hochladen, bevor du live startest.`);
+    }
+  };
+  check(presentation.backgroundImage, "Das Hintergrundbild");
+  presentation.slides.forEach((slide, index) => {
+    check(slide.content.videoUrl, `Das Video auf Folie ${index + 1}`);
+    for (const element of slide.elements) if (element.kind === "image" || element.kind === "video") check(element.content, `Ein Medium auf Folie ${index + 1}`);
+  });
+}
+
+/** Missing and explicit empty keys both mean no grading; only null/absent is legacy. */
+export function quizKeyProblem(presentation: Presentation, keys: PrivateQuizKey[]): { slideId: string; message: string } | null {
+  for (const [index, slide] of presentation.slides.entries()) {
+    if (slide.type !== "multiple_choice") continue;
+    const matches = keys.filter(key => key.slideId === slide.id);
+    const indices = matches[0]?.correctIndices;
+    const options = slide.content.options;
+    if (matches.length !== 1 || !Array.isArray(indices) || !indices.length || !Array.isArray(options) ||
+        indices.some(i => !Number.isInteger(i) || i < 0 || i >= options.length || typeof options[i] !== "string" || !options[i].trim()) ||
+        new Set(indices).size !== indices.length || (indices.length > 1 && !slide.content.allowMultiple)) {
+      return { slideId: slide.id, message: `Folie ${index + 1} („${slide.title || "Ohne Titel"}“) hat keinen gültigen vollständigen Lösungsschlüssel. Markiere im Editor mindestens eine nicht leere Antwort als richtig; bei mehreren richtigen Antworten muss Mehrfachauswahl aktiv sein.` };
+    }
+  }
+  return null;
+}
+const localKey = (presentationId: string) => `plexia.private.quiz-keys.v1.${presentationId}`;
+const pendingKey = (presentationId: string) => `plexia.private.quiz-pending.v1.${presentationId}`;
+
+// These stores are teacher-device-only; never merge them into presentation JSON.
+export function readPendingQuizEdits(presentationId: string): Record<string, PendingQuizEdit> {
+  const raw = localStorage.getItem(pendingKey(presentationId));
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isObject(parsed)) throw new Error();
+    return parsed as Record<string, PendingQuizEdit>;
+  } catch { throw new Error("Der lokale Wiederherstellungsentwurf für Lösungsschlüssel ist beschädigt. Er wurde nicht überschrieben."); }
+}
+export function writePendingQuizEdits(presentationId: string, edits: Record<string, PendingQuizEdit>): void {
+  if (Object.keys(edits).length) localStorage.setItem(pendingKey(presentationId), JSON.stringify(edits));
+  else localStorage.removeItem(pendingKey(presentationId));
+}
+export function writeLocalPrivateQuizKeys(presentationId: string, keys: PrivateQuizKey[]): void {
+  if (hasSupabaseConfig) throw new Error("Private Cloud-Schlüssel dürfen nur über den atomaren Veröffentlichungsweg gespeichert werden.");
+  localStorage.setItem(localKey(presentationId), JSON.stringify(keys));
+}
+export function deleteLocalQuizKeys(presentationId: string): void {
+  localStorage.removeItem(localKey(presentationId));
+  localStorage.removeItem(pendingKey(presentationId));
+}
+export async function loadPrivateQuizKeys(presentationId: string): Promise<PrivateQuizKey[]> {
+  if (!hasSupabaseConfig || !supabase) {
+    const raw = localStorage.getItem(localKey(presentationId));
+    if (!raw) return [];
+    try {
+      const keys: unknown = JSON.parse(raw);
+      if (!Array.isArray(keys)) throw new Error();
+      return keys as PrivateQuizKey[];
+    } catch { throw new Error("Die lokalen Lösungsschlüssel sind beschädigt und wurden nicht überschrieben."); }
+  }
+  const { data, error } = await supabase.from("teacher_quiz_keys")
+    .select("slide_id,correct_index,correct_indices,explanation").eq("presentation_id", presentationId);
+  if (error) throw new Error(`Private Lösungsschlüssel konnten nicht geladen werden (Migration correct_indices und Anmeldung prüfen): ${error.message}`);
+  return (data ?? []).map(row => {
+    const correctIndex = Number(row.correct_index);
+    const correctIndices = Array.isArray(row.correct_indices) ? row.correct_indices : [correctIndex];
+    if (!correctIndices.every((value: unknown) => Number.isInteger(value) && Number(value) >= 0)) throw new Error("Ein gespeicherter privater Lösungsschlüssel ist ungültig; er wurde nicht verändert.");
+    return { slideId: String(row.slide_id), correctIndex, correctIndices: correctIndices as number[], explanation: String(row.explanation ?? "") };
+  });
+}
+export interface ImportedPresentation { presentation: Presentation; privateQuizKeys: PrivateQuizKey[]; uploadedPaths: string[] }
+
+/** Only delete the exact objects just uploaded for a copy known not to be saved. */
+export async function cleanupImportedMedia(paths: string[]): Promise<void> {
+  if (!paths.length) return;
+  if (!supabase || paths.some(path => !isSafeStoragePath(path))) throw new Error("Die hochgeladenen Medien konnten nicht sicher bereinigt werden.");
+  const { error } = await supabase.storage.from("presentation-media").remove(paths);
+  if (error) throw new Error(error.message);
+}
 const PRIVATE_KEYS_FILE = "private/quiz-keys.json";
 const PRIVATE_KEYS_FORMAT = "plexia-private-quiz-keys";
 
@@ -176,28 +260,29 @@ function makeDownload(blob: Blob, filename: string): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
-export async function exportPresentation(presentation: Presentation): Promise<void> {
+export type ExportResult = { status: "exported" | "cancelled" | "error"; message: string; keyCount?: number };
+export async function exportPresentation(presentation: Presentation): Promise<ExportResult> {
   announce("progress", "Präsentation und Medien werden für den Export vorbereitet…");
   try {
     if (!presentation || !Array.isArray(presentation.slides)) throw new Error("Die Präsentation ist unvollständig.");
-    let privateQuizKeys: PrivateQuizKey[] = [];
-    if (hasSupabaseConfig && supabase) {
-      const { data, error } = await supabase.from("teacher_quiz_keys")
-        .select("slide_id,correct_index,explanation").eq("presentation_id", presentation.id);
-      if (error) throw new Error("Private Quiz-Schlüssel konnten nicht sicher geladen werden. Prüfe deine Lehrkraft-Anmeldung und versuche es erneut.");
-      privateQuizKeys = (data ?? []).map((row) => ({
-        slideId: String(row.slide_id), correctIndex: Number(row.correct_index), explanation: String(row.explanation ?? ""),
-      }));
-    }
+    if (Object.keys(readPendingQuizEdits(presentation.id)).length) throw new Error("Es gibt noch nicht synchronisierte private Lösungsschlüssel. Öffne die Präsentation und synchronisiere sie vor dem Export.");
+    const slideIds = new Set(presentation.slides.filter(slide => slide.type === "multiple_choice").map(slide => slide.id));
+    let privateQuizKeys = (await loadPrivateQuizKeys(presentation.id)).filter(key => slideIds.has(key.slideId));
     privateQuizKeys = validatePrivateQuizKeys(privateQuizKeys, presentation);
     if (privateQuizKeys.length && !window.confirm(`Diese .plexia-Datei enthält ${privateQuizKeys.length} vertrauliche Lösungsschlüssel und Erklärungen. Bewahre die Datei geschützt auf und teile sie nur mit berechtigten Lehrkräften. Trotzdem exportieren?`)) {
-      announce("success", "Export abgebrochen; es wurde keine Datei erstellt.");
-      return;
+      const message = "Export abgebrochen; kein Download wurde gestartet.";
+      announce("success", message);
+      return { status: "cancelled", message };
     }
     const copy = stripPrivateAnswerFields(JSON.parse(JSON.stringify(presentation))) as Presentation;
     const files: ZipFile[] = [];
     const media: MediaDescriptor[] = [];
     const locations: MediaLocation[] = [];
+    const backgroundImage = (copy as Presentation & { backgroundImage?: string }).backgroundImage;
+    if (backgroundImage) {
+      const source = mediaSource(backgroundImage);
+      if (source === "storage" || source === "inline") locations.push({ mediaId: newUuid(), background: true, source: backgroundImage, kind: source });
+    }
     for (const slide of copy.slides) {
       for (const element of slide.elements ?? []) {
         if (element.kind === "image" || element.kind === "video") {
@@ -226,7 +311,8 @@ export async function exportPresentation(presentation: Presentation): Promise<vo
       files.push({ name: filename, bytes });
       media.push({ id: location.mediaId, file: filename, mimeType: result.mimeType, size: bytes.byteLength });
       const token = `plexia-media:${location.mediaId}`;
-      if (location.element) location.element.content = token;
+      if (location.background) (copy as Presentation & { backgroundImage?: string }).backgroundImage = token;
+      else if (location.element) location.element.content = token;
       else if (location.contentKey && location.slide) location.slide.content[location.contentKey] = token;
     }
     const manifest: PresentationArchive = { format: FORMAT, version: FORMAT_VERSION, presentation: copy, media };
@@ -240,10 +326,13 @@ export async function exportPresentation(presentation: Presentation): Promise<vo
     }
     const archive = makeZip(entries);
     makeDownload(new Blob([archive.buffer as ArrayBuffer], { type: "application/zip" }), safeFilename(presentation.title));
-    announce("success", `„${presentation.title || "Präsentation"}“ wurde als .plexia-Datei exportiert${media.length ? ` (${media.length} Medien)` : ""}${privateQuizKeys.length ? `, inklusive ${privateQuizKeys.length} vertraulicher Lösungsschlüssel` : ""}.`);
+    const message = `Download von „${presentation.title || "Präsentation"}“ als .plexia-Datei gestartet${media.length ? ` (${media.length} Medien)` : ""}${privateQuizKeys.length ? `, inklusive ${privateQuizKeys.length} vertraulicher Lösungsschlüssel` : ""}.`;
+    announce("success", message);
+    return { status: "exported", message, keyCount: privateQuizKeys.length };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Präsentationsexport fehlgeschlagen.";
     announce("error", message);
+    return { status: "error", message };
   }
 }
 
@@ -288,16 +377,25 @@ function readZip(bytes: Uint8Array): ParsedZipEntry[] {
 }
 
 function isObject(value: unknown): value is Record<string, unknown> { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
-function stripPrivateAnswerFields(value: unknown): unknown {
+function hasUnsupportedPrivateAnswerFields(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasUnsupportedPrivateAnswerFields);
+  if (!isObject(value)) return false;
+  const unsupported = new Set(["correctAnswer", "correct_answer", "correctAnswers", "correct_answers", "isCorrect", "is_correct", "answerKey", "answer_key"]);
+  return Object.entries(value).some(([key, child]) => unsupported.has(key) || hasUnsupportedPrivateAnswerFields(child));
+}
+export function stripPrivateAnswerFields(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripPrivateAnswerFields);
   if (!isObject(value)) return value;
   return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !["correctIndex", "correct_index", "answerKey", "answer_key", "explanation"].includes(key))
+    .filter(([key]) => !["correctIndex", "correct_index", "correctIndices", "correct_indices", "correctAnswer", "correct_answer", "correctAnswers", "correct_answers", "isCorrect", "is_correct", "answerKey", "answer_key", "explanation"].includes(key))
     .map(([key, child]) => [key, stripPrivateAnswerFields(child)]));
 }
-function normalizePresentation(value: unknown): { presentation: Presentation; repairedIds: number; slideIdRemap: Map<string, string[]> } {
+function normalizePresentation(value: unknown): { presentation: Presentation; repairedIds: number; slideIdRemap: Map<string, string[]>; legacyQuizKeys: PrivateQuizKey[] } {
   if (!isObject(value) || value.version !== 1 || typeof value.title !== "string" || !Array.isArray(value.slides) || value.slides.length < 1 || value.slides.length > MAX_SLIDES) {
     throw new Error(`Keine gültige PLEXIA-Präsentation (Version 1, 1–${MAX_SLIDES} Folien erwartet).`);
+  }
+  if (hasUnsupportedPrivateAnswerFields(value)) {
+    throw new Error("Die Datei enthält ein nicht unterstütztes Format für private Quizlösungen. Der Import wurde abgebrochen, damit keine Lösungen verloren gehen.");
   }
   const raw = value as Record<string, unknown>;
   let repairedIds = 0; const ids = new Set<string>();
@@ -309,6 +407,7 @@ function normalizePresentation(value: unknown): { presentation: Presentation; re
   };
   const slidesRaw = raw.slides as unknown[];
   const slideIdRemap = new Map<string, string[]>();
+  const legacyQuizKeys: PrivateQuizKey[] = [];
   const presentationTitle = raw.title as string;
   const safeSlides: PlexiaSlide[] = slidesRaw.map((rawSlide: unknown, slideIndex: number) => {
     if (!isObject(rawSlide) || !Array.isArray(rawSlide.elements) || !isObject(rawSlide.content)) throw new Error(`Folie ${slideIndex + 1} ist fehlerhaft.`);
@@ -330,6 +429,23 @@ function normalizePresentation(value: unknown): { presentation: Presentation; re
       const originalKey = originalId.toLowerCase();
       slideIdRemap.set(originalKey, [...(slideIdRemap.get(originalKey) ?? []), normalizedId]);
     }
+    const content = slide.content as Record<string, unknown>;
+    if (slide.type === "multiple_choice") {
+      const single=content.correctIndex ?? content.correct_index;
+      const multiple=content.correctIndices ?? content.correct_indices;
+      if (single === undefined && multiple === undefined && content.explanation !== undefined) {
+        throw new Error(`Folie ${slideIndex + 1} enthält eine Erklärung ohne zugehörigen Lösungsschlüssel. Der Import wurde zum Schutz der Daten abgebrochen.`);
+      }
+      if(single !== undefined || multiple !== undefined) {
+        if ((single !== undefined && (!Number.isInteger(single) || Number(single)<0)) ||
+            (multiple !== undefined && (!Array.isArray(multiple) || !multiple.every(index=>Number.isInteger(index) && index>=0))) ||
+            (content.explanation !== undefined && typeof content.explanation !== "string")) {
+          throw new Error(`Eingebetteter privater Lösungsschlüssel auf Folie ${slideIndex+1} ist ungültig. Der Import wurde zum Schutz der Daten abgebrochen.`);
+        }
+        const indices = multiple === undefined ? [single as number] : multiple as number[];
+        legacyQuizKeys.push({slideId:normalizedId,correctIndex:indices[0] ?? (single as number | undefined) ?? 0,correctIndices:indices,explanation:(content.explanation as string | undefined) ?? ""});
+      }
+    }
     const safeContent = stripPrivateAnswerFields(slide.content) as PlexiaSlide["content"];
     const safeSlide = stripPrivateAnswerFields(slide) as Record<string, unknown>;
     return { ...safeSlide, id: normalizedId, content: safeContent, elements: safeElements } as unknown as PlexiaSlide;
@@ -342,26 +458,34 @@ function normalizePresentation(value: unknown): { presentation: Presentation; re
   const presentation: Presentation = {
     id: importedId, title: presentationTitle.slice(0, 160), description: typeof raw.description === "string" ? raw.description.slice(0, 20_000) : "",
     theme, slides: safeSlides, version: 1, updatedAt: new Date().toISOString(),
+    ...(typeof raw.backgroundImage === "string" ? { backgroundImage: raw.backgroundImage } : {}),
+    ...(isObject(raw.participation) ? { participation: {
+      avatarsEnabled: raw.participation.avatarsEnabled === true,
+      nicknameGeneratorEnabled: raw.participation.nicknameGeneratorEnabled === true,
+    } } : {}),
   };
-  return { presentation, repairedIds, slideIdRemap };
+  validatePresentationTimeLimits(presentation);
+  return { presentation, repairedIds, slideIdRemap, legacyQuizKeys: validatePrivateQuizKeys(legacyQuizKeys,presentation) };
 }
 
 function validatePrivateQuizKeys(keys: PrivateQuizKey[], presentation: Presentation): PrivateQuizKey[] {
   const slides = new Map(presentation.slides.map((slide) => [slide.id.toLowerCase(), slide]));
   const seen = new Set<string>();
   return keys.map((key) => {
+    const indices = Array.isArray(key.correctIndices) ? key.correctIndices : [key.correctIndex];
     if (!isUuid(key.slideId) || !Number.isInteger(key.correctIndex) || key.correctIndex < 0 ||
+      !indices.every(index => Number.isInteger(index) && index >= 0) || new Set(indices).size !== indices.length ||
       typeof key.explanation !== "string" || key.explanation.length > 2000) {
       throw new Error("Ein privater Quiz-Schlüssel hat ein ungültiges Format.");
     }
     const slideId = key.slideId.toLowerCase();
     const slide = slides.get(slideId);
     if (!slide || slide.type !== "multiple_choice" || !Array.isArray(slide.content.options) ||
-      key.correctIndex >= slide.content.options.length || seen.has(slideId)) {
+      indices.some(index => index >= slide.content.options!.length) || seen.has(slideId)) {
       throw new Error("Ein privater Quiz-Schlüssel passt nicht eindeutig zu einer Multiple-Choice-Folie.");
     }
     seen.add(slideId);
-    return { slideId: slide.id, correctIndex: key.correctIndex, explanation: key.explanation };
+    return { slideId: slide.id, correctIndex: indices[0] ?? key.correctIndex, correctIndices: [...indices].sort((a,b) => a-b), explanation: key.explanation };
   });
 }
 
@@ -374,10 +498,12 @@ function parsePrivateQuizKeys(bytes: Uint8Array): PrivateQuizKey[] {
   }
   return value.keys.map((item) => {
     if (!isObject(item) || !isUuid(item.slideId) || !Number.isInteger(item.correctIndex) ||
+      (item.correctIndices !== undefined && (!Array.isArray(item.correctIndices) || !item.correctIndices.every(index => Number.isInteger(index)))) ||
       typeof item.explanation !== "string" || item.explanation.length > 2000) {
       throw new Error("Ein privater Quiz-Schlüssel hat ein ungültiges Format.");
     }
-    return { slideId: item.slideId, correctIndex: item.correctIndex as number, explanation: item.explanation };
+    return { slideId: item.slideId, correctIndex: item.correctIndex as number,
+      correctIndices: item.correctIndices === undefined ? [item.correctIndex as number] : item.correctIndices as number[], explanation: item.explanation };
   });
 }
 
@@ -413,6 +539,8 @@ function validateAndMapPackage(entries: ParsedZipEntry[]): { presentation: Prese
     if (!descriptor) throw new Error("Eine Folie verweist auf ein nicht vorhandenes Medium.");
     referenced.add(id); return value;
   };
+  const presentationWithBackground = normalized.presentation as Presentation & { backgroundImage?: string };
+  if (presentationWithBackground.backgroundImage) presentationWithBackground.backgroundImage = mapValue(presentationWithBackground.backgroundImage);
   for (const slide of normalized.presentation.slides) {
     for (const element of slide.elements) if (element.kind === "image" || element.kind === "video") element.content = mapValue(element.content);
     if (typeof slide.content.videoUrl === "string") slide.content.videoUrl = mapValue(slide.content.videoUrl);
@@ -427,6 +555,12 @@ function validateAndMapPackage(entries: ParsedZipEntry[]): { presentation: Prese
       return { ...key, slideId: targets[0] };
     });
     privateQuizKeys = validatePrivateQuizKeys(privateQuizKeys, normalized.presentation);
+  }
+  for (const legacy of normalized.legacyQuizKeys) {
+    const existing=privateQuizKeys.find(key=>key.slideId===legacy.slideId);
+    if(existing && (JSON.stringify(existing.correctIndices)!==JSON.stringify(legacy.correctIndices) || existing.explanation!==legacy.explanation))
+      throw new Error("Das Archiv enthält widersprüchliche private Quiz-Schlüssel. Der Import wurde zum Schutz der Daten abgebrochen.");
+    if(!existing) privateQuizKeys.push(legacy);
   }
   return { presentation: normalized.presentation, repairedIds: normalized.repairedIds, media: [...descriptors.values()].map(descriptor => ({ descriptor, bytes: byName.get(descriptor.file)!.bytes })), privateQuizKeys };
 }
@@ -445,17 +579,22 @@ async function importPlexia(file: File): Promise<ImportedPresentation> {
       const path = await uploadPresentationMedia(parsed.presentation.id, mediaFile);
       uploadedPaths.push(path);
       const marker = `plexia-media:${item.descriptor.id}`;
+      const presentationWithBackground = parsed.presentation as Presentation & { backgroundImage?: string };
+      if (presentationWithBackground.backgroundImage === marker) presentationWithBackground.backgroundImage = path;
       for (const slide of parsed.presentation.slides) {
         for (const element of slide.elements) if ((element.kind === "image" || element.kind === "video") && element.content === marker) element.content = path;
         if (slide.content.videoUrl === marker) slide.content.videoUrl = path;
       }
     }
   } catch (error) {
-    if (uploadedPaths.length && supabase) await supabase.storage.from("presentation-media").remove(uploadedPaths).catch(() => undefined);
+    try { await cleanupImportedMedia(uploadedPaths); }
+    catch {
+      throw new Error(`Der Medienimport ist fehlgeschlagen und die Bereinigung wurde nicht bestätigt. Prüfe im privaten Supabase-Storage den Ordner für Präsentations-ID ${parsed.presentation.id} und entferne dort die importierten Dateien manuell. Quelldatei aufbewahren. ${error instanceof Error ? error.message : ""}`);
+    }
     throw error;
   }
-  announce("success", `„${parsed.presentation.title}“ importiert${parsed.media.length ? `; ${parsed.media.length} Medien in deinen privaten Speicher geladen` : ""}${parsed.privateQuizKeys.length ? `; ${parsed.privateQuizKeys.length} vertrauliche Lösungsschlüssel erkannt` : ""}${parsed.repairedIds ? `; ${parsed.repairedIds} ungültige oder doppelte IDs sicher erneuert` : ""}.`);
-  return { presentation: parsed.presentation, privateQuizKeys: parsed.privateQuizKeys };
+  announce("progress", `„${parsed.presentation.title}“ geprüft${parsed.media.length ? `; ${parsed.media.length} Medien hochgeladen` : ""}${parsed.privateQuizKeys.length ? `; ${parsed.privateQuizKeys.length} vertrauliche Lösungsschlüssel erkannt` : ""}${parsed.repairedIds ? `; ${parsed.repairedIds} IDs erneuert` : ""}; Präsentation wird gespeichert…`);
+  return { presentation: parsed.presentation, privateQuizKeys: parsed.privateQuizKeys, uploadedPaths };
 }
 
 export async function importPresentation(file: File): Promise<ImportedPresentation> {
@@ -467,6 +606,6 @@ export async function importPresentation(file: File): Promise<ImportedPresentati
   let parsed: unknown;
   try { parsed = JSON.parse(await file.text()); } catch { throw new Error("Die Datei ist weder ein gültiges .plexia-Archiv noch eine JSON-Präsentation."); }
   const normalized = normalizePresentation(parsed);
-  announce("success", `„${normalized.presentation.title}“ als JSON importiert${normalized.repairedIds ? `; ${normalized.repairedIds} ungültige oder doppelte IDs sicher erneuert` : ""}.`);
-  return { presentation: normalized.presentation, privateQuizKeys: [] };
+  announce("progress", `„${normalized.presentation.title}“ als JSON geprüft; Präsentation wird gespeichert…`);
+  return { presentation: normalized.presentation, privateQuizKeys: normalized.legacyQuizKeys, uploadedPaths: [] };
 }

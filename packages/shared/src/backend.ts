@@ -1,5 +1,5 @@
 import { createClient, type RealtimeChannel, type SupabaseClient } from "@supabase/supabase-js";
-import type { ClassSession, Presentation, SessionBundle, SessionGroupAssignment, StudentResponse } from "./model";
+import type { ClassSession, Presentation, SessionBundle, SessionGroupAssignment, StudentResponse, JoinOptions, RankingEntry } from "./model";
 
 const env = import.meta.env ?? {};
 const supabaseUrl = env.VITE_SUPABASE_URL as string | undefined;
@@ -22,7 +22,23 @@ export function requireSupabase(): SupabaseClient {
   return supabase;
 }
 
-export type SyncedClassSession = ClassSession & { syncUpdatedAt: string };
+export type SyncedClassSession = ClassSession & { syncUpdatedAt: string; activityRemainingMs: number | null };
+
+/** The server timer reads this field on every slide, not just quizzes. */
+export function validatePresentationTimeLimits(presentation: Presentation): void {
+  presentation.slides.forEach((slide, index) => {
+    const value: unknown = slide.content.timeLimitSeconds;
+    if (value !== undefined && value !== null &&
+        (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 86400)) {
+      throw new Error(`Folie ${index + 1} („${slide.title || "Ohne Titel"}“): Das Zeitlimit muss eine ganze Zahl von 1 bis 86400 Sekunden sein oder leer bleiben.`);
+    }
+  });
+}
+
+export function initialActivityStatus(presentation: Presentation): "idle" | "running" {
+  const first = presentation.slides[0];
+  return first?.type === "multiple_choice" && first.content.timeLimitSeconds != null ? "idle" : "running";
+}
 
 function mapSession(row: Record<string, unknown>): SyncedClassSession {
   return {
@@ -32,6 +48,8 @@ function mapSession(row: Record<string, unknown>): SyncedClassSession {
     status: row.status as ClassSession["status"],
     currentSlideIndex: Number(row.current_slide_index ?? 0),
     activityStatus: (row.activity_status ?? "idle") as ClassSession["activityStatus"],
+    activityDeadline: row.activity_deadline == null ? null : String(row.activity_deadline),
+    activityRemainingMs: row.activity_remaining_ms == null ? null : Number(row.activity_remaining_ms),
     createdAt: String(row.created_at ?? new Date().toISOString()),
     syncUpdatedAt: String(row.updated_at ?? ""),
   };
@@ -68,6 +86,27 @@ function withTimeout<T>(promise: PromiseLike<T>, message: string, milliseconds =
     const timer = window.setTimeout(() => reject(new Error(message)), milliseconds);
     Promise.resolve(promise).then((value) => { window.clearTimeout(timer); resolve(value); }, (error: unknown) => { window.clearTimeout(timer); reject(error); });
   });
+}
+
+export interface ServerClockSample { offsetMs: number; receivedWallMs: number; receivedMonotonicMs: number }
+
+/** The RPC supplies an authenticated server timestamp, not the device clock. */
+export async function getServerClock(client: SupabaseClient = requireSupabase()): Promise<ServerClockSample> {
+  const { data, error } = await withTimeout(client.rpc("plexia_server_time"), "Die Serverzeit konnte nicht abgeglichen werden.", 5000);
+  if (error) throw error;
+  const parsed = typeof data === "string" && /(?:z|[+-]\d{2}:?\d{2})$/i.test(data) ? Date.parse(data) : NaN;
+  if (!Number.isFinite(parsed)) throw new Error("Die Serverzeit ist ungültig.");
+  const receivedWallMs = Date.now();
+  return { offsetMs: parsed - receivedWallMs, receivedWallMs, receivedMonotonicMs: performance.now() };
+}
+
+/** Samples are lower-bound estimates and are invalid after sleep, clock changes or 30 seconds. */
+export function estimateServerTime(sample: ServerClockSample, wallMs = Date.now(), monotonicMs = performance.now()): number | null {
+  const elapsed = monotonicMs - sample.receivedMonotonicMs;
+  if (!Number.isFinite(elapsed) || !Number.isFinite(wallMs) || elapsed < 0 || elapsed > 30_000 ||
+      Math.abs((wallMs - sample.receivedWallMs) - elapsed) > 1500) return null;
+  const estimate = sample.receivedWallMs + sample.offsetMs + elapsed;
+  return Number.isFinite(estimate) ? estimate : null;
 }
 
 // Coalesces invalidations and prevents a response started before an event/write
@@ -148,21 +187,23 @@ export async function listPresentations(): Promise<Presentation[]> {
   return (data ?? []).map((row: { data: Presentation }) => row.data);
 }
 
-export async function savePresentation(presentation: Presentation): Promise<void> {
+export interface PresentationQuizKey {
+  slideId: string;
+  correctIndex: number;
+  correctIndices: number[];
+  explanation: string;
+}
+
+export async function savePresentation(presentation: Presentation, keys: PresentationQuizKey[] = []): Promise<void> {
   const client = requireSupabase();
   const { data: userResult, error: userError } = await client.auth.getUser();
   if (userError) throw userError;
   if (!userResult.user) throw new Error("Bitte melde dich an, um die Präsentation in der Cloud zu speichern.");
   const next = { ...presentation, updatedAt: new Date().toISOString() };
-  const payload = {
-    id: next.id,
-    owner_id: userResult.user.id,
-    title: next.title,
-    description: next.description,
-    data: next,
-    updated_at: next.updatedAt,
-  };
-  const write = () => client.from("presentations").upsert(payload, { onConflict: "id" });
+  const write = () => client.rpc("publish_presentation_with_quiz_keys", {
+    p_presentation: next,
+    p_keys: keys,
+  });
   let result = await write();
   if (result.error && ["401", "42501", "PGRST301"].includes(String(result.error.code))) {
     await client.auth.refreshSession();
@@ -186,10 +227,23 @@ export async function uploadPresentationMedia(presentationId: string, file: File
   if (/[\\/]/.test(authData.user.id)) throw new Error("Die Konto-ID ist ungültig.");
   const extension = file.name.split(".").pop()?.replace(/[^a-z0-9]/gi, "").toLowerCase() || "bin";
   const path = `${authData.user.id}/${presentationId}/${crypto.randomUUID()}.${extension}`;
-  const { error } = await client.storage.from("presentation-media").upload(path, file, {
-    cacheControl: "3600", upsert: false, contentType: file.type,
-  });
-  if (error) throw error;
+  try {
+    const { error } = await client.storage.from("presentation-media").upload(path, file, {
+      cacheControl: "3600", upsert: false, contentType: file.type,
+    });
+    if (error) throw error;
+  } catch (error) {
+    // A failed request can have reached storage. This new random path has not
+    // yet been returned to a presentation, so removing it is safe.
+    try {
+      const result = await client.storage.from("presentation-media").remove([path]);
+      if (result.error) throw result.error;
+    } catch {
+      throw new Error(`Der Upload ist fehlgeschlagen und seine Bereinigung wurde nicht bestätigt. Prüfe diesen Pfad im privaten presentation-media-Storage und entferne ihn gegebenenfalls manuell: ${path}`);
+    }
+    const reason = error instanceof Error ? error.message : "Verbindungs- oder Speicherfehler";
+    throw new Error(`Der Upload ist fehlgeschlagen: ${reason}. Eine Bereinigung wurde angefordert. Bei Verbindungsabbruch prüfe später im privaten presentation-media-Storage, ob unter ${path} eine Restdatei liegt, und entferne sie gegebenenfalls manuell.`);
+  }
   return path;
 }
 
@@ -272,20 +326,55 @@ export async function deletePresentationStorage(presentationId: string): Promise
 
 export async function createClassSession(presentation: Presentation): Promise<SyncedClassSession> {
   const client = requireSupabase();
-  await savePresentation(presentation);
+  validatePresentationTimeLimits(presentation);
   const { data, error } = await client.from("class_sessions").insert({
     presentation_id: presentation.id,
     status: "live",
     current_slide_index: 0,
-    activity_status: "running",
-  }).select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at,updated_at").single();
+    activity_status: initialActivityStatus(presentation),
+  }).select("id,presentation_id,join_code,status,current_slide_index,activity_status,activity_deadline,activity_remaining_ms,created_at,updated_at").single();
   if (error) throw error;
   return mapSession(data as Record<string, unknown>);
 }
 
+/** Only session metadata, never participant or response data. RLS remains authoritative. */
+export interface OpenClassSession {
+  id: string;
+  joinCode: string;
+  status: "live" | "paused";
+  createdAt: string;
+  syncUpdatedAt: string;
+}
+
+export async function listOwnOpenClassSessions(presentationId: string, client: SupabaseClient = requireSupabase()): Promise<OpenClassSession[]> {
+  const { data: auth, error: authError } = await withTimeout(client.auth.getUser(), "Die Anmeldung konnte nicht geprüft werden.");
+  if (authError) throw new Error(`Die Anmeldung konnte nicht geprüft werden: ${authError.message}`);
+  if (!auth.user || auth.user.is_anonymous) throw new Error("Bitte melde dich als Lehrkraft an, um deine Sitzungen zu sehen.");
+
+  const sessions: OpenClassSession[] = [];
+  const pageSize = 100;
+  for (let offset = 0; ; offset += pageSize) {
+    if (offset >= 10_000) throw new Error("Zu viele offene Sitzungen für eine vollständige Anzeige. Bitte wende dich an den Support.");
+    const { data, error } = await withTimeout(client.from("class_sessions")
+      .select("id,join_code,status,created_at,updated_at")
+      .eq("owner_id", auth.user.id).eq("presentation_id", presentationId).in("status", ["live", "paused"])
+      .order("created_at", { ascending: false }).order("id", { ascending: false })
+      .range(offset, offset + pageSize - 1), "Die offenen Sitzungen konnten nicht geladen werden.");
+    if (error) throw new Error(`Die offenen Sitzungen konnten nicht geladen werden: ${error.message}`);
+    for (const row of data ?? []) {
+      if ((row.status !== "live" && row.status !== "paused") || !row.id || !row.updated_at) {
+        throw new Error("Der Status einer Sitzung ist unvollständig. Bitte aktualisiere die Liste.");
+      }
+      sessions.push({ id: String(row.id), joinCode: String(row.join_code ?? ""), status: row.status,
+        createdAt: String(row.created_at ?? ""), syncUpdatedAt: String(row.updated_at) });
+    }
+    if ((data ?? []).length < pageSize) return sessions;
+  }
+}
+
 export async function getClassSession(sessionId: string): Promise<SyncedClassSession> {
   const { data, error } = await withTimeout(requireSupabase().from("class_sessions")
-    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at,updated_at")
+    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,activity_deadline,activity_remaining_ms,created_at,updated_at")
     .eq("id", sessionId).single(), "Der Sitzungsstatus konnte nicht geladen werden.");
   if (error) throw error;
   return mapSession(data as Record<string, unknown>);
@@ -300,7 +389,7 @@ export async function updateClassSession(sessionId: string, patch: Partial<Pick<
   // The DB trigger, not a client clock, supplies updated_at. CAS avoids lost updates.
   const { data, error } = await withTimeout(client.from("class_sessions").update(values)
     .eq("id", sessionId).eq("updated_at", expectedUpdatedAt).neq("status", "ended")
-    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at,updated_at").maybeSingle(),
+    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,activity_deadline,activity_remaining_ms,created_at,updated_at").maybeSingle(),
     "Der Sitzungsbefehl wurde nicht bestätigt. Der aktuelle Status wird erneut geladen.");
   if (error) throw error;
   if (!data) throw new Error("Die Sitzung wurde zwischenzeitlich geändert oder beendet. Bitte prüfe den aktuellen Status und versuche es erneut.");
@@ -310,7 +399,7 @@ export async function updateClassSession(sessionId: string, patch: Partial<Pick<
 export async function getSessionBundle(sessionId: string): Promise<SessionBundle> {
   const client = requireSupabase();
   const { data: sessionRow, error: sessionError } = await client.from("class_sessions")
-    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at")
+    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,activity_deadline,created_at")
     .eq("id", sessionId).single();
   if (sessionError) throw sessionError;
   const { data: presentationRow, error: presentationError } = await client.from("presentations").select("data")
@@ -336,7 +425,7 @@ export async function joinClassSession(joinCode: string, nickname: string): Prom
   if (data && typeof data === "object" && "error" in data && typeof data.error === "string") throw new Error(data.error);
   const bundle = data as { session_id?: string; session?: Record<string, unknown>; presentation?: Presentation };
   if (bundle?.session && bundle.presentation) {
-    return { session: mapSession(bundle.session), presentation: bundle.presentation };
+    return { session: await getClassSession(String(bundle.session.id)), presentation: bundle.presentation };
   }
   if (!bundle?.session_id) throw new Error("Der Zugangscode wurde nicht gefunden oder die Sitzung ist beendet.");
   return getSessionBundle(bundle.session_id);
@@ -568,4 +657,58 @@ export async function requestAiEvaluation(payload: {
   maxPoints: number;
 }): Promise<{ evaluation: import("./model").GroqEvaluation }> {
   return groqProxy("evaluate", payload as unknown as Record<string, unknown>);
+}
+
+/** Start/reuse an anonymous student identity before requesting pre-join options. */
+export async function getJoinOptions(joinCode: string, client: SupabaseClient = requireSupabase()): Promise<JoinOptions> {
+  const { data: current, error: sessionError } = await client.auth.getSession();
+  if (sessionError) throw sessionError;
+  if (!current.session?.user.is_anonymous) {
+    if (current.session) {
+      const { error } = await client.auth.signOut({ scope: "local" });
+      if (error) throw error;
+    }
+    const { error } = await client.auth.signInAnonymously({ options: { data: { account_type: "student" } } });
+    if (error) throw error;
+  }
+  const { data, error } = await client.rpc("get_join_options", { p_join_code: joinCode.trim().toUpperCase() });
+  if (error) throw error;
+  if (data && typeof data.error === "string") throw new Error(data.error);
+  if (typeof data?.avatars_enabled !== "boolean" || typeof data?.nickname_generator_enabled !== "boolean") throw new Error("Die Teilnahmeoptionen sind nicht verfügbar.");
+  return { avatarsEnabled: data.avatars_enabled, nicknameGeneratorEnabled: data.nickname_generator_enabled };
+}
+
+/** Avatar is an opaque identifier, not a URL or arbitrary personal data. */
+export async function setMySessionAvatar(sessionId: string, avatar: string | null, client: SupabaseClient = requireSupabase()): Promise<void> {
+  const { error } = await client.rpc("set_my_session_avatar", { p_session_id: sessionId, p_avatar: avatar });
+  if (error) throw error;
+}
+
+/** Read only the current anonymous participant's membership via existing RLS. */
+export async function getMySessionAvatar(sessionId: string, client: SupabaseClient = requireSupabase()): Promise<string | null> {
+  const { data: auth, error: authError } = await client.auth.getUser();
+  if (authError) throw authError;
+  if (!auth.user?.is_anonymous) throw new Error("Die anonyme Teilnahme ist nicht verfügbar.");
+  const { data, error } = await client.from("session_participants").select("avatar")
+    .eq("session_id", sessionId).eq("user_id", auth.user.id).maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("Die Teilnahme ist nicht verfügbar.");
+  return data.avatar == null ? null : String(data.avatar);
+}
+
+/** The server grades the already submitted immutable answer; no key is returned. */
+export async function gradeMyQuizResponse(sessionId: string, slideId: string, client: SupabaseClient = requireSupabase()): Promise<{ isCorrect: boolean }> {
+  const { data, error } = await client.rpc("grade_my_quiz_response", { p_session_id: sessionId, p_slide_id: slideId });
+  if (error) throw error;
+  if (typeof data?.is_correct !== "boolean") throw new Error("Die Quizbewertung ist nicht verfügbar.");
+  return { isCorrect: data.is_correct };
+}
+
+/** Ranking is server-authorized and contains pseudonym, avatar and score only. */
+export async function getSessionRanking(sessionId: string, client: SupabaseClient = requireSupabase()): Promise<RankingEntry[]> {
+  const { data, error } = await client.rpc("get_session_ranking", { p_session_id: sessionId });
+  if (error) throw error;
+  return (data ?? []).map((row: { nickname: string; avatar: string | null; correct_count: number }) => ({
+    nickname: row.nickname, avatar: row.avatar, correctCount: Number(row.correct_count),
+  }));
 }

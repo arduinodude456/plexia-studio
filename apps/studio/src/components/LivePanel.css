@@ -22,16 +22,115 @@
 .live-ai-result li, .handwriting-result li { margin: 3px 0; }
 .live-ai-result > small, .handwriting-result > small, .student-photo-panel > small { display: block; margin-top: 7px; color: var(--muted); font-size: 12px; }
 .live-ai-empty { color: var(--muted) !important; font-style: italic; }
-.live-inline-error { color: #92293d !important; background: #fff0f2; border-radius: 8px; padding: 10px; overflow-wrap: anywhere; }
+.live-inline-error { color: #352376 !important; background: #ffc952; border: 2px dashed #352376; border-radius: 8px; padding: 10px; overflow-wrap: anywhere; }
 .student-photo-panel { margin-bottom: 9px; }
 .student-photo { display: block; max-width: 100%; max-height: 260px; object-fit: contain; margin: 9px auto 4px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .photo-expiry-note { text-align: center; }
 .handwriting-result h4 span { color: var(--muted); font: 500 12px 'DM Sans', sans-serif; margin-left: 4px; }
-.handwriting-text { border-left: 3px solid #765bdd; padding-left: 10px; }
-:root[data-theme="dark"] .live-ai-panel, :root[data-theme="dark"] .student-photo-panel { background: #2c2d42; }
-:root[data-theme="dark"] .live-ai-result, :root[data-theme="dark"] .handwriting-result { background: #242638; }
-:root[data-theme="dark"] .live-inline-error { background: #4b2634; color: #ffd4da !important; }
+.handwriting-text { border-left: 3px solid #5638bd; padding-left: 10px; }
+:root[data-theme="dark"] .live-ai-panel, :root[data-theme="dark"] .student-photo-panel { background: #352376; color: #fff; border-color: #ffc952; }
+:root[data-theme="dark"] .live-ai-result, :root[data-theme="dark"] .handwriting-result { background: #352376; color: #fff; border: 1px solid #ffc952; }
+:root[data-theme="dark"] .live-inline-error { background: #ffc952; color: #352376 !important; }
 @media (max-width: 600px) {
   .live-ai-panel, .student-photo-panel { padding: 12px; }
   .student-photo { max-height: 190px; }
+}
+
+/* Contrasting focus indicators for light surfaces and the dark live header. */
+:root .live-overlay :is(button, a, input, textarea, select, [tabindex]):focus-visible { outline: 3px solid #5638bd; outline-offset: 3px; }
+:root[data-theme="dark"] .live-overlay :is(button, a, input, textarea, select, [tabindex]):focus-visible,
+:root .live-overlay .live-top :is(button, a, input, textarea, select, [tabindex]):focus-visible,
+:root .live-overlay .live-present-mode :is(button, a, input, textarea, select):focus-visible { outline-color: #ffc952; }
+
+/* Only the slide and its live overlay are exposed in presentation mode. */
+.live-overlay:fullscreen { width: 100%; height: 100%; }
+.live-overlay .live-present-mode {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: #352376;
+  color: #fff;
+}
+.live-overlay .live-present-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  overflow: hidden;
+}
+.live-overlay .live-present-stage .live-slide-transition {
+  width: min(100%, calc((100vh - 100px) * 1.7777778));
+  max-width: none;
+}
+.live-overlay .live-present-stage .live-stage-with-response-overlay { max-width: none; }
+/* Status chrome is not part of the slide; keep the dynamic content itself. */
+.live-overlay .live-present-mode .live-slide-response-badge { display: none; }
+/* Cross-origin iframes swallow keyboard events. In CSS-only fallback, prevent
+   their focus so Escape remains available; native fullscreen keeps controls. */
+.live-overlay .live-present-mode.is-css-fallback iframe { pointer-events: none; }
+.live-overlay .live-present-nav {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  min-height: 76px;
+  padding: 8px 64px;
+  font-size: 14px;
+}
+.live-overlay .live-present-nav .button { min-height: 42px; padding: 9px 16px; font-size: 14px; }
+.live-overlay .live-present-nav .button.secondary { background: #fff; color: #352376; }
+.live-overlay .live-present-nav .button.primary { background: #ffc952; color: #352376; }
+.live-overlay .live-present-close {
+  position: absolute;
+  right: 16px;
+  bottom: 19px;
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: #5638bd;
+  border: 1px solid #fff;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.live-overlay .live-present-close:focus-visible, .live-ranking-canvas:focus-visible { outline: 3px solid #ffc952; outline-offset: 3px; }
+.live-overlay .live-slide-response-results { inset: 25% 7% 5%; }
+.live-overlay .live-ranking-canvas {
+  flex: 1;
+  min-height: 0;
+  padding: clamp(8px, 1.2vw, 16px);
+  overflow: auto;
+  border-radius: 16px;
+  background: #fff;
+  color: #352376;
+  pointer-events: auto;
+}
+.live-overlay .live-ranking-canvas p { text-align: center; font-size: clamp(10px, 1.3vw, 18px); }
+.live-overlay .live-ranking-list { margin: 0; padding: 0; list-style: none; }
+.live-overlay .live-ranking-list li {
+  display: flex;
+  align-items: center;
+  gap: clamp(5px, .8vw, 12px);
+  padding: clamp(3px, .5vw, 7px) 0;
+  border-bottom: 1px solid #5638bd;
+  font-size: clamp(9px, 1.1vw, 16px);
+}
+.live-overlay .live-ranking-list li strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-overlay .live-ranking-list li > span:last-child { white-space: nowrap; font-weight: 700; }
+.live-overlay .live-ranking-place { width: 2em; font-weight: 800; }
+.live-overlay .live-ranking-avatar { display: grid; place-items: center; flex: none; width: 2em; height: 2em; border-radius: 50%; background: #ffc952; color: #352376; overflow: hidden; }
+.live-overlay .live-ranking-canvas small { display: block; margin-top: 6px; font-size: clamp(8px, .8vw, 11px); }
+@media (max-width: 600px) {
+  .live-overlay .live-present-stage { padding: 6px; }
+  .live-overlay .live-present-nav { gap: 6px; padding: 6px 48px 6px 6px; min-height: 62px; font-size: 11px; }
+  .live-overlay .live-present-nav .button { min-height: 38px; padding: 7px 9px; font-size: 11px; }
+  .live-overlay .live-present-close { right: 6px; bottom: 12px; width: 38px; height: 38px; }
+  .live-overlay .live-slide-response-results { inset: 29% 4% 3%; }
 }
